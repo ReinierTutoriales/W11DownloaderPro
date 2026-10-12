@@ -1,0 +1,81 @@
+name: Compilar, probar y empaquetar
+
+on:
+  push:
+    branches: [main, politicas-y-motor]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publicar una release (prerelease) con el paquete"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write # solo se usa al publicar la release
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar (release, Windows x64)
+        shell: bash
+        run: cargo build --release
+
+      - name: Empaquetar con yt-dlp y ffmpeg verificados por hash
+        shell: bash
+        run: python packaging/bundle.py --bin-dir target/release
+
+      - name: Comprobar el paquete
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=$(ls -d dist/w11dl-*-windows-x64)
+          "$dir/w11dl.exe" --version
+          "$dir/w11dl-host.exe" status
+          "$dir/w11dl-host.exe" status | grep -q "incluido y listo"
+          "$dir/tools/ffmpeg.exe" -version | head -1
+          (cd "$dir" && sha256sum -c SHA256SUMS.txt)
+
+      - name: Pruebas de Rust con las herramientas incluidas
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=$(pwd)/$(ls -d dist/w11dl-*-windows-x64)
+          export W11DL_PYTHON="$dir/tools/yt-dlp.exe"
+          export PATH="$dir/tools:$PATH"
+          cargo test --release
+
+      - name: Pruebas de la extensión
+        shell: bash
+        working-directory: extension
+        run: npm test
+
+      - name: Guardar el paquete como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: w11dl-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          retention-days: 14
+
+      - name: Publicar la release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          gh release create "v$version" dist/*.zip dist/*.zip.sha256 \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "W11DownloaderPro $version (pruebas)" \
+            --notes-file packaging/release-notes.md

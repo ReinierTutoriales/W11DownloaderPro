@@ -1,5 +1,7 @@
-//! Entorno de yt-dlp que gestiona la aplicación. Se crea con `w11dl-host setup`:
-//! un entorno virtual propio con yt-dlp fijado por hash. Así no depende del PATH ni del Python del usuario.
+//! Herramientas de vídeo de la aplicación. En la versión empaquetada vienen incluidas junto al
+//! ejecutable (carpeta `tools`: yt-dlp, ffmpeg y ffprobe) y no hay que instalar nada. Si no están,
+//! `w11dl-host setup` crea un entorno virtual propio con yt-dlp fijado por hash, sin depender del
+//! PATH ni del Python del usuario.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,6 +16,55 @@ pub const REQUIREMENTS_LOCK: &str = include_str!("../packaging/requirements.lock
 /// Versión de yt-dlp que fija el lock (formato de PyPI).
 pub const YTDLP_PIN: &str = "2026.8.19";
 const MIN_PYTHON: (u32, u32) = (3, 10);
+
+/// Carpeta `tools` que acompaña a un ejecutable (versión empaquetada), si existe.
+pub fn bundled_dir_near(exe_dir: &Path) -> Option<PathBuf> {
+    let dir = exe_dir.join("tools");
+    dir.is_dir().then_some(dir)
+}
+
+fn bundled_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    bundled_dir_near(exe.parent()?)
+}
+
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// yt-dlp incluido en la versión empaquetada.
+pub fn bundled_ytdlp() -> Option<PathBuf> {
+    let path = bundled_dir()?.join(exe_name("yt-dlp"));
+    path.is_file().then_some(path)
+}
+
+/// ffmpeg incluido en la versión empaquetada (junto a su ffprobe, que yt-dlp busca al lado).
+pub fn bundled_ffmpeg() -> Option<PathBuf> {
+    let path = bundled_dir()?.join(exe_name("ffmpeg"));
+    path.is_file().then_some(path)
+}
+
+/// ¿Es `program` un yt-dlp autónomo (ejecutable propio) y no un Python con el módulo `yt_dlp`?
+pub fn is_standalone_ytdlp(program: &Path) -> bool {
+    program.file_stem().is_some_and(|stem| {
+        stem.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("yt-dlp")
+    })
+}
+
+/// Argumentos previos para lanzar yt-dlp: ninguno si es autónomo, `-m yt_dlp` si es un Python.
+pub fn ytdlp_prefix(program: &Path) -> &'static [&'static str] {
+    if is_standalone_ytdlp(program) {
+        &[]
+    } else {
+        &["-m", "yt_dlp"]
+    }
+}
 
 /// Estado del entorno de vídeo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +189,10 @@ fn run(program: &Path, args: &[&str]) -> Result<String> {
 
 /// Crea el entorno, instala yt-dlp con verificación de hash y comprueba la versión.
 pub fn setup(data: &Path) -> Result<Status> {
+    // La versión empaquetada ya trae yt-dlp: no hay entorno que crear.
+    if let Some(status) = check_bundled() {
+        return Ok(status);
+    }
     std::fs::create_dir_all(data)?;
     let python = venv_python(data);
     if !python.exists() {
@@ -184,6 +239,9 @@ pub fn setup(data: &Path) -> Result<Status> {
 
 /// Estado actual sin cambiar nada: el entorno existe y yt-dlp responde con la versión fijada.
 pub fn check(data: &Path) -> Status {
+    if let Some(status) = check_bundled() {
+        return status;
+    }
     let python = venv_python(data);
     if !python.exists() {
         let message = match find_base_python() {
@@ -218,6 +276,31 @@ pub fn check(data: &Path) -> Status {
     }
 }
 
+/// Estado del yt-dlp incluido, o `None` si esta no es una versión empaquetada.
+fn check_bundled() -> Option<Status> {
+    let program = bundled_ytdlp()?;
+    Some(match run(&program, &["--version"]) {
+        Ok(version) if same_version(&version, YTDLP_PIN) => Status {
+            ready: true,
+            python: Some(program),
+            message: format!("yt-dlp {} incluido y listo", version.trim()),
+        },
+        Ok(version) => Status {
+            ready: false,
+            python: Some(program),
+            message: format!(
+                "el yt-dlp incluido es {} y se esperaba {YTDLP_PIN}",
+                version.trim()
+            ),
+        },
+        Err(e) => Status {
+            ready: false,
+            python: Some(program),
+            message: format!("el yt-dlp incluido no responde: {e}"),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +320,31 @@ mod tests {
         assert!(same_version("2026.08.19\n", "2026.8.19"));
         assert!(!same_version("2026.08.20", "2026.8.19"));
         assert!(!same_version("", "2026.8.19"));
+    }
+
+    #[test]
+    fn yt_dlp_autonomo_o_modulo_de_python() {
+        for standalone in [
+            "yt-dlp.exe",
+            "/x/tools/yt-dlp",
+            "C:/t/YT-DLP.EXE",
+            "yt-dlp_linux",
+        ] {
+            assert!(is_standalone_ytdlp(Path::new(standalone)), "{standalone}");
+            assert!(ytdlp_prefix(Path::new(standalone)).is_empty());
+        }
+        for python in ["python", "python3.13", "/venv/bin/python", "py.exe"] {
+            assert!(!is_standalone_ytdlp(Path::new(python)), "{python}");
+            assert_eq!(ytdlp_prefix(Path::new(python)), ["-m", "yt_dlp"]);
+        }
+    }
+
+    #[test]
+    fn herramientas_incluidas_solo_si_hay_carpeta_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(bundled_dir_near(dir.path()), None);
+        std::fs::create_dir(dir.path().join("tools")).unwrap();
+        assert_eq!(bundled_dir_near(dir.path()), Some(dir.path().join("tools")));
     }
 
     #[test]

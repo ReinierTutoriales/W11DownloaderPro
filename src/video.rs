@@ -86,7 +86,7 @@ pub async fn probe(page: &str, opts: &ProbeOptions) -> Result<Choice> {
         ))
     })?;
     let mut cmd = Command::new(&python);
-    cmd.arg("-m").arg("yt_dlp").args([
+    cmd.args(crate::runtime::ytdlp_prefix(&python)).args([
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
@@ -331,7 +331,8 @@ fn has_audio(f: &Format) -> bool {
 /// Página oficial de ffmpeg con las descargas para Windows.
 pub const FFMPEG_DOWNLOAD_URL: &str = "https://ffmpeg.org/download.html";
 
-/// Busca ffmpeg: `W11DL_FFMPEG`, la carpeta de datos de la aplicación y el PATH, en ese orden.
+/// Busca ffmpeg: `W11DL_FFMPEG`, el incluido junto al ejecutable, la carpeta de datos de la
+/// aplicación y el PATH, en ese orden.
 /// Solo devuelve una ruta que responde a `-version`.
 pub async fn find_ffmpeg() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -343,6 +344,7 @@ pub async fn find_ffmpeg() -> Option<PathBuf> {
     } else {
         "ffmpeg"
     };
+    candidates.extend(crate::runtime::bundled_ffmpeg());
     candidates.push(crate::runtime::data_dir().join("ffmpeg").join(name));
     candidates.push(PathBuf::from(name));
     for candidate in candidates {
@@ -381,11 +383,13 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Python con yt-dlp por defecto: `W11DL_PYTHON` si existe (para desarrollo), o el entorno que
-/// creó `w11dl-host setup`.
+/// Con qué se lanza yt-dlp por defecto: `W11DL_PYTHON` si existe (para desarrollo), el yt-dlp
+/// incluido junto al ejecutable (versión empaquetada) o el entorno que creó `w11dl-host setup`.
+/// Puede ser un Python con el módulo `yt_dlp` o un yt-dlp autónomo.
 pub fn default_python() -> Option<PathBuf> {
     std::env::var_os("W11DL_PYTHON")
         .map(PathBuf::from)
+        .or_else(crate::runtime::bundled_ytdlp)
         .or_else(crate::runtime::configured_python)
 }
 

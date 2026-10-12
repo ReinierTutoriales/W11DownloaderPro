@@ -1,24 +1,23 @@
 W11DownloaderPro 0.0.1 — VERSIÓN DE PRUEBAS
 ==========================================
 
-Esto es una versión de pruebas, no estable y sin firmar. Se ha compilado y verificado en Linux
-(pruebas automáticas); en Windows 11 NO se ha ejecutado todavía. Tu prueba es la primera.
+Esto es una versión de pruebas, no estable y sin firmar. Se ha verificado con pruebas automáticas
+(en Linux y, si ves el sello de la release, en Windows); la prueba en tu equipo es la primera con Firefox real.
 Windows puede mostrar un aviso de SmartScreen porque los .exe no están firmados.
 
 Qué incluye
 -----------
   w11dl.exe        Línea de órdenes: w11dl <url> -o archivo.zip   (opciones: w11dl --help)
-  w11dl-host.exe   Host de mensajería nativa para el navegador (register, setup, run-queue...)
+  w11dl-host.exe   Host de mensajería nativa para el navegador (register, status, run-queue...)
   extension\       Extensión de Firefox (se carga como complemento temporal)
-  requirements.lock  Versión fijada de yt-dlp (la usa "w11dl-host.exe setup")
+  tools\           yt-dlp, ffmpeg y ffprobe ya incluidos (ver NOTICES.txt): no hay que instalar nada
+  SHA256SUMS.txt   Suma de verificación de cada archivo del paquete
 
 Requisitos
 ----------
-  - Windows 11 de 64 bits y Firefox 128 o superior.
-  - Opcional, para vídeo: Python 3.10 o superior  https://www.python.org/downloads/
-  - Opcional, para vídeo con imagen y sonido separados, HLS y DASH: ffmpeg
-    https://ffmpeg.org/download.html   (debe estar en el PATH, o define W11DL_FFMPEG con su ruta)
-  Sin Python o sin ffmpeg, las descargas normales funcionan igual; el vídeo te dirá qué falta.
+  - Windows 11 de 64 bits y Firefox 128 o superior. Nada más: Python y ffmpeg NO hacen falta.
+  - Los programas de la carpeta tools se usan automáticamente. Si prefieres otro ffmpeg, define
+    W11DL_FFMPEG con su ruta.
 
 Instalación
 -----------
@@ -28,7 +27,7 @@ Instalación
         .\w11dl-host.exe register --firefox-id w11dl@reiniertutoriales
      Esto escribe un manifiesto en %LOCALAPPDATA%\W11DownloaderPro y una clave en
      HKCU\Software\Mozilla\NativeMessagingHosts (solo tu usuario; no hace falta ser administrador).
-     También intenta preparar yt-dlp; si falta Python lo dice y sigue.
+     Comprueba también el yt-dlp incluido y lo indica.
   3. En Firefox abre  about:debugging#/runtime/this-firefox  → "Cargar complemento temporal…" →
      elige  extension\manifest.json
      El complemento temporal se quita al cerrar Firefox; hay que cargarlo de nuevo cada vez.
@@ -52,8 +51,8 @@ Línea de órdenes (útil para aislar problemas)
 ---------------------------------------------
   .\w11dl.exe https://sitio/archivo.zip -o archivo.zip -c 8
   .\w11dl.exe https://sitio/archivo.zip --limit 2M          (límite de velocidad)
-  .\w11dl.exe "https://sitio/pagina-con-video" --video      (necesita Python+yt-dlp; ffmpeg para HLS)
-  .\w11dl-host.exe status                                    (¿está listo el entorno de vídeo?)
+  .\w11dl.exe "https://sitio/pagina-con-video" --video      (usa el yt-dlp y el ffmpeg incluidos)
+  .\w11dl-host.exe status                                    (¿está listo el vídeo?)
 
 Programar una cola (opcional, sin verificar en Windows)
 -------------------------------------------------------

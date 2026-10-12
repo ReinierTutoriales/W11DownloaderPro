@@ -50,9 +50,10 @@ fn escape_template(text: &str) -> String {
 pub fn build_args(job: &YtDlpJob) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |a: &str| args.push(a.into());
+    for a in crate::runtime::ytdlp_prefix(&job.python) {
+        push(a);
+    }
     for a in [
-        "-m",
-        "yt_dlp",
         "--no-playlist",
         "--no-warnings",
         "--no-cache-dir",
@@ -285,6 +286,15 @@ mod tests {
         );
         assert!(!a.contains("--limit-rate") && !a.contains("--cookies"));
         assert!(a.contains("--ffmpeg-location ffmpeg"));
+    }
+
+    #[test]
+    fn yt_dlp_autonomo_se_lanza_sin_el_modulo_de_python() {
+        let mut j = job();
+        j.python = "C:/app/tools/yt-dlp.exe".into();
+        assert!(!joined(&j).starts_with("-m yt_dlp"), "{}", joined(&j));
+        assert!(joined(&j).starts_with("--no-playlist"));
+        assert!(joined(&job()).starts_with("-m yt_dlp --no-playlist"));
     }
 
     #[test]

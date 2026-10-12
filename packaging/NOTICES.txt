@@ -1,0 +1,24 @@
+Avisos de terceros — W11DownloaderPro
+=====================================
+
+Este paquete incluye, sin modificar, programas de terceros en la carpeta "tools". Cada uno se
+distribuye bajo su propia licencia, que no cambia por estar junto a W11DownloaderPro.
+
+yt-dlp  (tools\yt-dlp.exe)
+  Versión 2026.08.19, ejecutable oficial de https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19
+  Licencia: Unlicense (dominio público). El ejecutable oficial lleva incluido Python y sus
+  dependencias; sus licencias están en el código fuente del proyecto.
+
+FFmpeg  (tools\ffmpeg.exe, tools\ffprobe.exe, tools\FFMPEG-LICENSE.txt)
+  Compilación n9.0.2-27-g7e93014c5b de BtbN/FFmpeg-Builds, variante "lgpl" (sin componentes GPL).
+  Licencia: LGPL 2.1 o posterior; el texto está en tools\FFMPEG-LICENSE.txt.
+  Código fuente: https://github.com/FFmpeg/FFmpeg (commit 7e93014c5b) y el guion de compilación en
+  https://github.com/BtbN/FFmpeg-Builds. Puedes sustituir estos ejecutables por otros compatibles.
+
+Las versiones y los hashes SHA-256 exactos están fijados en packaging/third-party.json del
+repositorio y se comprueban al empaquetar.
+
+Dependencias de Rust del propio programa: ver Cargo.lock. Su inventario de licencias no se ha
+generado todavía (pendiente).
+
+Licencia de W11DownloaderPro: pendiente de decisión del titular del repositorio.
