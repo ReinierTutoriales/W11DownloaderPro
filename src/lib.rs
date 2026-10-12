@@ -3,6 +3,7 @@
 pub mod crawl;
 pub mod engine;
 pub mod error;
+pub mod limits;
 pub mod naming;
 pub mod native;
 pub mod net;

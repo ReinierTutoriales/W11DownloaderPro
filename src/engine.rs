@@ -50,6 +50,8 @@ pub struct Options {
     pub headers: HeaderMap,
     /// Bytes completados, actualizado en tiempo real por las tareas de descarga.
     pub progress: Option<Arc<AtomicU64>>,
+    /// Límite de velocidad compartido. El mismo `Arc` en varias descargas reparte un límite global.
+    pub limiter: Option<Arc<crate::limits::RateLimiter>>,
 }
 
 impl Options {
@@ -64,6 +66,7 @@ impl Options {
             proxy: ProxyMode::System,
             headers: HeaderMap::new(),
             progress: None,
+            limiter: None,
         }
     }
 }
@@ -275,6 +278,8 @@ async fn segmented(
         flights: std::sync::Mutex::new(HashMap::new()),
         typical_rate: AtomicU64::new(0),
         hedges: AtomicUsize::new(0),
+        limiter: opts.limiter.clone(),
+        saving: Mutex::new(()),
         settled: tokio::sync::Notify::new(),
     });
 
@@ -423,6 +428,9 @@ struct Shared {
     typical_rate: AtomicU64,
     /// Copias lanzadas (diagnóstico y pruebas).
     hedges: AtomicUsize,
+    limiter: Option<Arc<crate::limits::RateLimiter>>,
+    /// Un solo guardado de estado a la vez: comparten archivo temporal y el más reciente debe ser el último.
+    saving: Mutex<()>,
     /// Avisa a los trabajadores en espera de que un fragmento terminó (puede que ya no quede nada que copiar).
     settled: tokio::sync::Notify,
 }
@@ -500,7 +508,10 @@ impl Shared {
     /// Con la cola vacía: elige un fragmento lento para copiar, espera, o termina.
     fn next_idle(&self) -> Idle {
         // Un servidor que ya rechaza conexiones no quiere más: no se abren copias.
-        if self.refusals.load(Ordering::Relaxed) > 0 {
+        // Con límite de velocidad, una copia solo gastaría el ancho de banda permitido.
+        if self.refusals.load(Ordering::Relaxed) > 0
+            || self.limiter.as_ref().is_some_and(|l| l.rate() > 0)
+        {
             return Idle::Done;
         }
         let typical = self.typical_rate();
@@ -727,6 +738,7 @@ async fn fetch_with_retry(
             shared.if_range.as_deref(),
             &shared.headers,
             &[&shared.rx_bytes, flight_bytes],
+            shared.limiter.as_deref(),
         )
         .await
         {
@@ -758,6 +770,7 @@ async fn fetch_with_retry(
 /// debe estar realmente en disco. El estado se toma antes de sincronizar, así que todo lo
 /// marcado tiene sus bytes escritos antes del `sync_data`.
 async fn checkpoint(shared: &Shared) -> Result<()> {
+    let _saving = shared.saving.lock().await;
     let snapshot = {
         let state = shared.state.lock().await;
         serde_json::to_vec(&*state)?
@@ -796,6 +809,9 @@ async fn single(
         }
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
+            if let Some(limiter) = &opts.limiter {
+                limiter.throttle(data.len() as u64).await;
+            }
             file.write_all(&data).await?;
             written += data.len() as u64;
             if let Some(p) = &opts.progress {

@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long)]
     sha256: Option<String>,
 
+    /// Límite de velocidad total, p. ej. 500K, 2M o 750000 (bytes/s). 0 = sin límite.
+    #[arg(long, value_parser = parse_limit)]
+    limit: Option<u64>,
+
     /// Proxy explícito, p. ej. http://proxy:8080.
     #[arg(long, conflicts_with = "no_proxy")]
     proxy: Option<String>,
@@ -139,6 +143,7 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     opts.proxy = proxy_mode(&cli.proxy, cli.no_proxy);
     opts.headers = header_map(&headers);
     opts.progress = Some(Arc::clone(&progress));
+    opts.limiter = limiter(&cli.limit);
 
     let result = download(opts).await;
     reporter.abort();
@@ -181,6 +186,7 @@ async fn run_crawl(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(true);
     }
 
+    let shared_limiter = limiter(&cli.limit);
     std::fs::create_dir_all(&cli.out_dir)?;
     let mut all_ok = true;
     for file in &found.files {
@@ -193,6 +199,7 @@ async fn run_crawl(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         opts.max_chunk = cli.max_chunk;
         opts.proxy = proxy.clone();
         opts.progress = Some(progress);
+        opts.limiter = shared_limiter.clone();
 
         let result = download(opts).await;
         reporter.abort();
@@ -221,6 +228,17 @@ fn header_map(pairs: &[(String, String)]) -> hyper::header::HeaderMap {
         }
     }
     map
+}
+
+fn parse_limit(text: &str) -> Result<u64, String> {
+    w11dl::limits::parse_rate(text)
+        .ok_or_else(|| format!("velocidad no válida: {text} (ejemplos: 500K, 2M)"))
+}
+
+fn limiter(limit: &Option<u64>) -> Option<Arc<w11dl::limits::RateLimiter>> {
+    limit
+        .filter(|&r| r > 0)
+        .map(w11dl::limits::RateLimiter::new)
 }
 
 fn proxy_mode(explicit: &Option<String>, direct: bool) -> ProxyMode {

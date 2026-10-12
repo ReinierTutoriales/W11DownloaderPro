@@ -150,6 +150,7 @@ pub async fn fetch_chunk(
     etag: Option<&str>,
     extra: &HeaderMap,
     received: &[&std::sync::atomic::AtomicU64],
+    limiter: Option<&crate::limits::RateLimiter>,
 ) -> Result<Bytes> {
     let mut builder = Request::builder()
         .method(Method::GET)
@@ -177,6 +178,9 @@ pub async fn fetch_chunk(
     while let Some(frame) = body.frame().await {
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
+            if let Some(limiter) = limiter {
+                limiter.throttle(data.len() as u64).await;
+            }
             for counter in received {
                 counter.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
