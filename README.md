@@ -67,3 +67,17 @@ w11dl <URL_PAGINA> --video [--python ruta\a\python.exe] [--cookies cookies.txt] 
 - **Qué elige**: formatos HTTP/HTTPS directos (mp4, webm, mkv, mov) con vídeo, priorizando los que traen audio y después la resolución más alta.
 - **Qué descarta**: contenido con DRM y streams segmentados HLS/DASH (previstos para la fase 2).
 - **Cookies**: nunca por defecto. Solo con `--cookies`, con un archivo Netscape de tu propia sesión. Usarlas puede llevar a bloqueo de cuenta en algunos sitios; la responsabilidad es del usuario.
+
+## Cola de descargas del host
+
+El host guarda la cola en `.w11dl-queue.json`, junto a las descargas. Comandos por el protocolo de mensajes:
+
+- `pause {id}`: pausa una descarga en curso. Conserva el progreso.
+- `resume {id}`: reanuda una descarga pausada, interrumpida o fallida desde su progreso.
+- `cancel {id}`: cancela y borra el parcial y su estado de reanudación.
+- `list`: devuelve la cola con estado y bytes descargados.
+
+Estados: `running`, `paused`, `interrupted` (estaba en curso al cerrar el host), `done`, `canceled`, `failed`.
+
+- Las cabeceras de sesión (cookies) **no se guardan en disco**. Tras reiniciar el host, una descarga que las necesitaba puede fallar al reanudarse; en ese caso se reintenta desde el navegador.
+- Un servidor sin rangos no permite reanudar: la pausa descarta lo recibido y empieza de cero.

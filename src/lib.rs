@@ -8,6 +8,7 @@ pub mod native;
 pub mod net;
 pub mod plan;
 pub mod proxy;
+pub mod queue;
 pub mod register;
 pub mod runtime;
 pub mod video;

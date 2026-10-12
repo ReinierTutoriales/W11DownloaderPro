@@ -5,7 +5,7 @@
 //! cuando recibe ese acuse, así una descarga nunca se pierde por un fallo de la conexión.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,9 +16,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc};
 use url::Url;
 
-use crate::engine::{self, Options};
+use crate::engine::{self, Control, Options, Outcome};
 use crate::naming;
 use crate::proxy::ProxyMode;
+use crate::queue::{Record, Registry, State};
 
 /// Límite de un mensaje entrante, según el protocolo del navegador.
 pub const MAX_INCOMING: usize = 1024 * 1024;
@@ -44,6 +45,20 @@ pub enum Incoming {
         id: String,
         page: String,
     },
+    /// Pausa una descarga en curso. Conserva el progreso para reanudarla.
+    Pause {
+        id: String,
+    },
+    /// Reanuda una descarga pausada, interrumpida o fallida desde su progreso guardado.
+    Resume {
+        id: String,
+    },
+    /// Cancela una descarga y borra lo descargado.
+    Cancel {
+        id: String,
+    },
+    /// Devuelve la cola completa.
+    List,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -70,6 +85,16 @@ pub enum Outgoing {
     Error {
         id: String,
         message: String,
+    },
+    Paused {
+        id: String,
+        bytes: u64,
+    },
+    Canceled {
+        id: String,
+    },
+    Queue {
+        items: Vec<Record>,
     },
 }
 
@@ -121,6 +146,10 @@ where
 
     let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut jobs = tokio::task::JoinSet::new();
+    let registry = Registry::load(&out_dir);
+    if let Err(e) = registry.save(&out_dir) {
+        eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
+    }
 
     while let Some(raw) = read_message(&mut input).await? {
         match serde_json::from_slice::<Incoming>(&raw) {
@@ -139,9 +168,10 @@ where
                 let slots = Arc::clone(&slots);
                 let tx = tx.clone();
                 let out_dir = out_dir.clone();
+                let registry = registry.clone();
                 jobs.spawn(async move {
                     let _permit = slots.acquire_owned().await.expect("semáforo abierto");
-                    run_video(id, page, out_dir, tx).await;
+                    run_video(id, page, out_dir, registry, tx).await;
                 });
             }
             Ok(Incoming::Enqueue {
@@ -150,22 +180,104 @@ where
                 filename,
                 headers,
             }) => match prepare(&id, &url, filename.as_deref(), &headers, &out_dir) {
-                Ok(job) => {
+                Ok(mut job) => {
                     let _ = tx.send(Outgoing::Accepted {
                         id: id.clone(),
                         path: job.output.display().to_string(),
                     });
+                    job.control = registry.insert(
+                        Record {
+                            id: id.clone(),
+                            url: job.url.clone(),
+                            path: job.output.clone(),
+                            state: State::Running,
+                            bytes: 0,
+                        },
+                        job.headers.clone(),
+                    );
+                    let _ = registry.save(&out_dir);
                     let slots = Arc::clone(&slots);
                     let tx = tx.clone();
+                    let registry = registry.clone();
+                    let out_dir = out_dir.clone();
                     jobs.spawn(async move {
                         let _permit = slots.acquire_owned().await.expect("semáforo abierto");
-                        run(job, tx).await;
+                        run(job, tx, registry, out_dir).await;
                     });
                 }
                 Err(message) => {
                     let _ = tx.send(Outgoing::Error { id, message });
                 }
             },
+            Ok(Incoming::Pause { id }) => {
+                let running = registry
+                    .get(&id)
+                    .filter(|e| e.record.state == State::Running);
+                match running {
+                    Some(entry) => entry.control.pause(),
+                    None => {
+                        let _ = tx.send(Outgoing::Error {
+                            id,
+                            message: "no está en curso: solo se pausan descargas activas".into(),
+                        });
+                    }
+                }
+            }
+            Ok(Incoming::Cancel { id }) => match registry.get(&id) {
+                Some(entry) if entry.record.state == State::Running => entry.control.cancel(),
+                Some(entry) if entry.record.state.is_resumable() => {
+                    remove_partials(&entry.record.path).await;
+                    registry.update(&id, |e| e.record.state = State::Canceled);
+                    let _ = registry.save(&out_dir);
+                    let _ = tx.send(Outgoing::Canceled { id });
+                }
+                _ => {
+                    let _ = tx.send(Outgoing::Error {
+                        id,
+                        message: "no hay nada que cancelar".into(),
+                    });
+                }
+            },
+            Ok(Incoming::Resume { id }) => match registry.get(&id) {
+                Some(entry) if entry.record.state.is_resumable() => {
+                    let control = Control::default();
+                    registry.update(&id, |e| {
+                        e.control = control.clone();
+                        e.record.state = State::Running;
+                    });
+                    let _ = registry.save(&out_dir);
+                    let job = Job {
+                        id: id.clone(),
+                        url: entry.record.url.clone(),
+                        output: entry.record.path.clone(),
+                        headers: entry.headers.clone(),
+                        control,
+                    };
+                    let _ = tx.send(Outgoing::Accepted {
+                        id: id.clone(),
+                        path: entry.record.path.display().to_string(),
+                    });
+                    let slots = Arc::clone(&slots);
+                    let tx = tx.clone();
+                    let registry = registry.clone();
+                    let out_dir = out_dir.clone();
+                    jobs.spawn(async move {
+                        let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+                        run(job, tx, registry, out_dir).await;
+                    });
+                }
+                _ => {
+                    let _ = tx.send(Outgoing::Error {
+                        id,
+                        message: "esta descarga no se puede reanudar".into(),
+                    });
+                }
+            },
+            Ok(Incoming::List) => {
+                let _ = tx.send(Outgoing::Queue {
+                    items: registry.records(),
+                });
+            }
             Err(e) => {
                 let _ = tx.send(Outgoing::Error {
                     id: String::new(),
@@ -187,6 +299,7 @@ struct Job {
     url: String,
     output: PathBuf,
     headers: HeaderMap,
+    control: Control,
 }
 
 /// Valida la petición antes de aceptarla: URL web, cabeceras permitidas y nombre seguro.
@@ -223,6 +336,7 @@ fn prepare(
         url: url.to_owned(),
         output,
         headers: map,
+        control: Control::default(),
     })
 }
 
@@ -235,6 +349,7 @@ async fn run_video(
     id: String,
     page: String,
     out_dir: PathBuf,
+    registry: Registry,
     tx: mpsc::UnboundedSender<Outgoing>,
 ) {
     let opts = crate::video::ProbeOptions {
@@ -272,16 +387,28 @@ async fn run_video(
         id: id.clone(),
         path: output.display().to_string(),
     });
+    let control = registry.insert(
+        Record {
+            id: id.clone(),
+            url: choice.url.clone(),
+            path: output.clone(),
+            state: State::Running,
+            bytes: 0,
+        },
+        headers.clone(),
+    );
     let job = Job {
         id,
         url: choice.url,
         output,
         headers,
+        control,
     };
-    run(job, tx).await;
+    run(job, tx, registry, out_dir).await;
 }
 
-async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>) {
+/// Ejecuta una descarga controlada y deja su resultado en la cola (y en disco).
+async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>, registry: Registry, out_dir: PathBuf) {
     let progress = Arc::new(AtomicU64::new(0));
     let reporter = {
         let progress = Arc::clone(&progress);
@@ -305,21 +432,66 @@ async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>) {
     opts.proxy = ProxyMode::System;
     opts.progress = Some(Arc::clone(&progress));
 
-    let result = engine::download(opts).await;
+    let result = engine::download_controlled(opts, job.control).await;
     reporter.abort();
 
     let message = match result {
-        Ok(report) => Outgoing::Done {
-            id: job.id,
-            path: job.output.display().to_string(),
-            bytes: report.bytes,
-        },
-        Err(e) => Outgoing::Error {
-            id: job.id,
-            message: e.to_string(),
-        },
+        Ok(Outcome::Completed(report)) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Done;
+                e.record.bytes = report.bytes;
+            });
+            Outgoing::Done {
+                id: job.id.clone(),
+                path: job.output.display().to_string(),
+                bytes: report.bytes,
+            }
+        }
+        Ok(Outcome::Paused { bytes }) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Paused;
+                e.record.bytes = bytes;
+            });
+            Outgoing::Paused {
+                id: job.id.clone(),
+                bytes,
+            }
+        }
+        Ok(Outcome::Canceled) => {
+            registry.update(&job.id, |e| e.record.state = State::Canceled);
+            Outgoing::Canceled { id: job.id.clone() }
+        }
+        Err(e) => {
+            let message = e.to_string();
+            registry.update(&job.id, |en| {
+                en.record.state = State::Failed {
+                    message: message.clone(),
+                }
+            });
+            Outgoing::Error {
+                id: job.id.clone(),
+                message,
+            }
+        }
     };
+    if let Err(e) = registry.save(&out_dir) {
+        eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
+    }
     let _ = tx.send(message);
+}
+
+/// Borra el parcial y su estado de reanudación de una descarga cancelada.
+async fn remove_partials(output: &Path) {
+    let part = naming_with_suffix(output, ".part");
+    let state = naming_with_suffix(output, ".part.state");
+    let _ = tokio::fs::remove_file(part).await;
+    let _ = tokio::fs::remove_file(state).await;
+}
+
+fn naming_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 #[cfg(test)]

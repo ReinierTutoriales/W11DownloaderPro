@@ -1,0 +1,184 @@
+//! Cola de descargas del host: estado de cada descarga, control (pausa y cancelación) y persistencia.
+//!
+//! Se guarda en disco solo lo necesario para retomar: URL, ruta y estado. Las cabeceras de sesión
+//! (cookies) se quedan en memoria: no se escriben nunca en disco.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use hyper::header::HeaderMap;
+use serde::{Deserialize, Serialize};
+
+use crate::engine::Control;
+
+/// Archivo de estado de la cola, junto a las descargas.
+pub const QUEUE_FILE: &str = ".w11dl-queue.json";
+
+/// Estado de una descarga.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum State {
+    Running,
+    Paused,
+    /// Estaba en curso cuando el host se cerró. Se puede reanudar.
+    Interrupted,
+    Done,
+    Canceled,
+    Failed {
+        message: String,
+    },
+}
+
+impl State {
+    /// Si la descarga puede reanudarse con `resume`.
+    pub fn is_resumable(&self) -> bool {
+        matches!(
+            self,
+            State::Paused | State::Interrupted | State::Failed { .. }
+        )
+    }
+}
+
+/// Lo que se persiste y se muestra en la lista.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub id: String,
+    pub url: String,
+    pub path: PathBuf,
+    #[serde(flatten)]
+    pub state: State,
+    pub bytes: u64,
+}
+
+/// Entrada en memoria: el registro, el control activo y las cabeceras de sesión (solo en memoria).
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub record: Record,
+    pub control: Control,
+    pub headers: HeaderMap,
+}
+
+/// Cola compartida por las tareas del host.
+#[derive(Clone, Default)]
+pub struct Registry(Arc<Mutex<Vec<Entry>>>);
+
+impl Registry {
+    /// Carga la cola guardada. Lo que estaba en curso queda como `Interrupted`.
+    pub fn load(dir: &Path) -> Self {
+        let text = std::fs::read_to_string(dir.join(QUEUE_FILE)).unwrap_or_default();
+        let records: Vec<Record> = serde_json::from_str(&text).unwrap_or_default();
+        let entries = records
+            .into_iter()
+            .map(|mut record| {
+                if matches!(record.state, State::Running | State::Paused) {
+                    record.state = State::Interrupted;
+                }
+                Entry {
+                    record,
+                    control: Control::default(),
+                    headers: HeaderMap::new(),
+                }
+            })
+            .collect();
+        Self(Arc::new(Mutex::new(entries)))
+    }
+
+    /// Añade una descarga en curso y devuelve su control.
+    pub fn insert(&self, record: Record, headers: HeaderMap) -> Control {
+        let control = Control::default();
+        let entry = Entry {
+            record,
+            control: control.clone(),
+            headers,
+        };
+        self.lock().push(entry);
+        control
+    }
+
+    /// Modifica el registro de una descarga. Devuelve `None` si no existe.
+    pub fn update<T>(&self, id: &str, f: impl FnOnce(&mut Entry) -> T) -> Option<T> {
+        let mut entries = self.lock();
+        entries.iter_mut().find(|e| e.record.id == id).map(f)
+    }
+
+    pub fn get(&self, id: &str) -> Option<Entry> {
+        self.lock().iter().find(|e| e.record.id == id).cloned()
+    }
+
+    pub fn records(&self) -> Vec<Record> {
+        self.lock().iter().map(|e| e.record.clone()).collect()
+    }
+
+    /// Guarda la cola en disco de forma atómica (archivo temporal y renombrado).
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_vec_pretty(&self.records()).map_err(std::io::Error::other)?;
+        let target = dir.join(QUEUE_FILE);
+        let tmp = dir.join(format!("{QUEUE_FILE}.tmp"));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &target)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(id: &str, state: State) -> Record {
+        Record {
+            id: id.into(),
+            url: format!("https://x.test/{id}"),
+            path: PathBuf::from(id),
+            state,
+            bytes: 7,
+        }
+    }
+
+    #[test]
+    fn al_cargar_lo_en_curso_queda_interrumpido() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::default();
+        reg.insert(record("a", State::Running), HeaderMap::new());
+        reg.insert(record("b", State::Paused), HeaderMap::new());
+        reg.insert(record("c", State::Done), HeaderMap::new());
+        reg.save(dir.path()).unwrap();
+
+        let loaded = Registry::load(dir.path());
+        let states: Vec<State> = loaded.records().into_iter().map(|r| r.state).collect();
+        assert_eq!(
+            states,
+            vec![State::Interrupted, State::Interrupted, State::Done]
+        );
+    }
+
+    #[test]
+    fn las_cabeceras_de_sesion_nunca_van_a_disco() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", "sid=secreto".parse().unwrap());
+        reg.insert(record("a", State::Running), headers);
+        reg.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(QUEUE_FILE)).unwrap();
+        assert!(!text.contains("secreto") && !text.to_lowercase().contains("cookie"));
+    }
+
+    #[test]
+    fn estados_reanudables() {
+        assert!(State::Paused.is_resumable());
+        assert!(State::Interrupted.is_resumable());
+        assert!(!State::Running.is_resumable());
+        assert!(!State::Done.is_resumable());
+    }
+
+    #[test]
+    fn update_sobre_id_inexistente_no_hace_nada() {
+        let reg = Registry::default();
+        assert!(reg.update("nope", |_| ()).is_none());
+    }
+}

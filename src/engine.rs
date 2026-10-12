@@ -71,7 +71,7 @@ pub enum Mode {
     Single,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Report {
     pub bytes: u64,
     /// Bytes bajados en esta ejecución (excluye lo recuperado de una reanudación).
@@ -81,26 +81,86 @@ pub struct Report {
     pub mode: Mode,
 }
 
+const RUN: u8 = 0;
+const PAUSE: u8 = 1;
+const CANCEL: u8 = 2;
+
+/// Control de una descarga en curso. Clonable: el llamador conserva una copia para pausar o cancelar.
+#[derive(Debug, Clone, Default)]
+pub struct Control(Arc<std::sync::atomic::AtomicU8>);
+
+impl Control {
+    pub fn pause(&self) {
+        self.0.store(PAUSE, Ordering::SeqCst);
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(CANCEL, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == PAUSE
+    }
+
+    fn state(&self) -> u8 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Resultado de una descarga controlada.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Outcome {
+    Completed(Report),
+    /// Pausada: el estado de reanudación está guardado. `bytes` son los ya completados.
+    Paused {
+        bytes: u64,
+    },
+    Canceled,
+}
+
+/// Descarga sin control externo. Si se interrumpiera, devuelve error.
 pub async fn download(opts: Options) -> Result<Report> {
+    match download_controlled(opts, Control::default()).await? {
+        Outcome::Completed(report) => Ok(report),
+        Outcome::Paused { .. } | Outcome::Canceled => {
+            Err(io::Error::other("descarga interrumpida").into())
+        }
+    }
+}
+
+pub async fn download_controlled(opts: Options, control: Control) -> Result<Outcome> {
     let started = Instant::now();
     let client = net::build_client(opts.connections, &opts.proxy)?;
     let remote = net::probe(&client, &opts.url, &opts.headers).await?;
     let headers = headers_for(&opts.url, &remote.url, &opts.headers);
-    let part = with_suffix(&opts.output, ".part");
-    let state_path = with_suffix(&opts.output, ".part.state");
-
-    let transfer = match (remote.ranges, remote.total) {
-        (true, Some(total)) if total > 0 => {
-            segmented(&client, &opts, &remote, &headers, total, &part, &state_path).await?
-        }
-        _ => single(&client, &opts, &remote, &headers, &part).await?,
+    let paths = Paths {
+        part: with_suffix(&opts.output, ".part"),
+        state: with_suffix(&opts.output, ".part.state"),
     };
 
+    let step = match (remote.ranges, remote.total) {
+        (true, Some(total)) if total > 0 => {
+            segmented(&client, &opts, &remote, &headers, total, &paths, &control).await?
+        }
+        _ => single(&client, &opts, &remote, &headers, &paths.part, &control).await?,
+    };
+    let transfer = match step {
+        Step::Finished(transfer) => transfer,
+        Step::Interrupted { bytes } => {
+            return Ok(if control.state() == CANCEL {
+                Outcome::Canceled
+            } else {
+                Outcome::Paused { bytes }
+            });
+        }
+    };
+
+    let (part, state_path) = (&paths.part, &paths.state);
     if let Some(expected) = &opts.sha256 {
-        let actual = sha256_of(&part).await?;
+        let actual = sha256_of(part).await?;
         if !actual.eq_ignore_ascii_case(expected) {
-            let _ = tokio::fs::remove_file(&part).await;
-            let _ = tokio::fs::remove_file(&state_path).await;
+            let _ = tokio::fs::remove_file(part).await;
+            let _ = tokio::fs::remove_file(state_path).await;
             return Err(Error::HashMismatch {
                 expected: expected.to_ascii_lowercase(),
                 actual,
@@ -108,16 +168,22 @@ pub async fn download(opts: Options) -> Result<Report> {
         }
     }
 
-    tokio::fs::rename(&part, &opts.output).await?;
-    remove_if_exists(&state_path).await?;
+    tokio::fs::rename(part, &opts.output).await?;
+    remove_if_exists(state_path).await?;
 
-    Ok(Report {
+    Ok(Outcome::Completed(Report {
         bytes: transfer.bytes,
         downloaded: transfer.downloaded,
         resumed: transfer.resumed,
         elapsed: started.elapsed(),
         mode: transfer.mode,
-    })
+    }))
+}
+
+/// Resultado interno de una pasada de descarga: terminada o interrumpida por el control.
+enum Step {
+    Finished(Transfer),
+    Interrupted { bytes: u64 },
 }
 
 struct Transfer {
@@ -127,15 +193,22 @@ struct Transfer {
     mode: Mode,
 }
 
+/// Rutas de trabajo de una descarga: el archivo parcial y su estado de reanudación.
+struct Paths {
+    part: PathBuf,
+    state: PathBuf,
+}
+
 async fn segmented(
     client: &HttpClient,
     opts: &Options,
     remote: &Remote,
     headers: &HeaderMap,
     total: u64,
-    part: &Path,
-    state_path: &Path,
-) -> Result<Transfer> {
+    paths: &Paths,
+    control: &Control,
+) -> Result<Step> {
+    let (part, state_path) = (paths.part.as_path(), paths.state.as_path());
     let url = remote.url.to_string();
     let chunk_size = plan::effective_chunk_size(total, opts.connections, opts.max_chunk);
 
@@ -164,6 +237,7 @@ async fn segmented(
 
     let shared = Arc::new(Shared {
         client: client.clone(),
+        control: control.clone(),
         url: remote.url.clone(),
         headers: headers.clone(),
         etag: remote.etag.clone(),
@@ -219,13 +293,21 @@ async fn segmented(
         }
     }
 
-    checkpoint(&shared).await?;
-    let done = shared.state.lock().await.done.iter().all(|d| *d);
-    if !done {
-        return Err(io::Error::other("quedaron fragmentos sin completar").into());
+    let done_now = shared.state.lock().await.done.iter().all(|d| *d);
+    if !done_now {
+        // Interrumpida: se conserva el progreso (pausa) o se borra todo (cancelación).
+        if control.state() == CANCEL {
+            let _ = tokio::fs::remove_file(part).await;
+            let _ = tokio::fs::remove_file(state_path).await;
+            return Ok(Step::Interrupted { bytes: 0 });
+        }
+        checkpoint(&shared).await?;
+        let bytes = shared.state.lock().await.completed_bytes();
+        return Ok(Step::Interrupted { bytes });
     }
+    checkpoint(&shared).await?;
 
-    Ok(Transfer {
+    Ok(Step::Finished(Transfer {
         bytes: total,
         downloaded: total - resumed,
         resumed,
@@ -233,12 +315,13 @@ async fn segmented(
             chunks: chunk_count,
             connections: peak,
         },
-    })
+    }))
 }
 
 /// Estado compartido por las tareas de descarga de una misma transferencia.
 struct Shared {
     client: HttpClient,
+    control: Control,
     url: Uri,
     headers: HeaderMap,
     etag: Option<String>,
@@ -301,7 +384,8 @@ impl Sampler {
 async fn run_worker(shared: Arc<Shared>, id: usize) -> Result<()> {
     loop {
         // Si el controlador redujo conexiones, este trabajador termina tras su fragmento actual.
-        if id >= shared.limit.load(Ordering::Relaxed) {
+        // Una pausa o cancelación también termina el trabajador tras el fragmento en curso.
+        if id >= shared.limit.load(Ordering::Relaxed) || shared.control.state() != RUN {
             return Ok(());
         }
         let slot = shared.cursor.fetch_add(1, Ordering::Relaxed);
@@ -378,13 +462,25 @@ async fn single(
     remote: &Remote,
     headers: &HeaderMap,
     part: &Path,
-) -> Result<Transfer> {
+    control: &Control,
+) -> Result<Step> {
     let resp = net::get_full(client, &remote.url, headers).await?;
     let mut body = resp.into_body();
     let mut file = tokio::fs::File::create(part).await?;
 
     let mut written = 0u64;
     while let Some(frame) = body.frame().await {
+        if control.state() != RUN {
+            // Sin rangos no hay forma de reanudar: se descarta lo recibido y la próxima vez empieza de cero.
+            drop(file);
+            let _ = tokio::fs::remove_file(part).await;
+            let bytes = if control.state() == CANCEL {
+                0
+            } else {
+                written
+            };
+            return Ok(Step::Interrupted { bytes });
+        }
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
             file.write_all(&data).await?;
@@ -405,12 +501,12 @@ async fn single(
         }
     }
 
-    Ok(Transfer {
+    Ok(Step::Finished(Transfer {
         bytes: written,
         downloaded: written,
         resumed: 0,
         mode: Mode::Single,
-    })
+    }))
 }
 
 async fn open_part(part: &Path, fresh: bool, total: u64) -> io::Result<File> {
