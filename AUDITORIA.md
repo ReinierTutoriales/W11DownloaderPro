@@ -33,7 +33,11 @@ Pruebas: 14 archivos de prueba y 2 módulos auxiliares en `tests/` (≈2 430 lí
 
 `tokio`, `hyper`, `hyper-util`, `hyper-rustls`, `rustls`, `http-body-util`, `bytes`, `sha2`, `clap`, `thiserror`, `serde`, `serde_json`, `tower-service`, `scraper`, `url`, `robotstxt`; en Windows `winreg`; de desarrollo `tempfile`.
 Versiones fijadas en `Cargo.lock`. Python/yt-dlp: `packaging/requirements.lock` con hashes SHA-256 (se instala con `--only-binary` y `--no-cache-dir`).
-**ffmpeg no está fijado ni verificado por hash**: es un binario del sistema que instala el usuario.
+**Herramientas incluidas en el paquete de Windows** (carpeta `tools`), fijadas en `packaging/third-party.json` y verificadas por SHA-256 al empaquetar (`packaging/bundle.py` aborta si un hash no coincide):
+- `yt-dlp.exe` 2026.08.19 (ejecutable oficial; el hash coincide con el `SHA2-256SUMS` de su release). Licencia Unlicense.
+- `ffmpeg.exe` y `ffprobe.exe` n9.0.2-27-g7e93014c5b (BtbN/FFmpeg-Builds, variante LGPL sin componentes GPL; hash comprobado descargando el archivo). Licencia LGPL 2.1+; requiere conservar `FFMPEG-LICENSE.txt` y ofrecer el código fuente (ver `NOTICES.txt`).
+- **El pin de ffmpeg apunta a una compilación fechada de un tercero**: si BtbN la retira, el empaquetado falla (a propósito) y hay que actualizar el pin. Sin ese paquete incluido, ffmpeg del sistema sigue siendo un binario sin verificar.
+- Los ejecutables propios y los de terceros **no están firmados**.
 
 ## 4. Funciones del motor y del host
 
@@ -105,7 +109,7 @@ Integración real: servidores locales con rangos, lentitud, rechazos, enlace rev
 8. **Vídeo delegado en yt-dlp:** no recibe las cookies del navegador; el límite de velocidad no cambia en caliente; el informe lo marca como `Single` aunque use 8 fragmentos.
 9. **Descargas en espera** no llevan cookies (el host no las guarda en disco).
 10. **Resumir un vídeo con pistas separadas tras reiniciar el host** no es posible (los enlaces viven en memoria); las delegadas en yt-dlp sí.
-11. **Procesos externos que se ejecutan:** `python` del entorno, `ffmpeg`, `schtasks`, `shutdown`, `rundll32`. La ruta de ffmpeg sale de `W11DL_FFMPEG`, de la carpeta de datos o del PATH. Conviene revisar si en Windows un nombre suelto podría resolverse en una ubicación no deseada (se resuelve manualmente por el PATH, pero la comprobación `-version` se lanza con el nombre suelto).
+11. **Procesos externos que se ejecutan:** `yt-dlp` (incluido, o un Python con `yt_dlp`), `ffmpeg`, `schtasks`, `shutdown`, `rundll32`. La ruta de ffmpeg sale de `W11DL_FFMPEG`, de `tools` junto al ejecutable, de la carpeta de datos o del PATH; la de yt-dlp, de `W11DL_PYTHON`, de `tools` o del entorno gestionado. Conviene revisar si en Windows un nombre suelto podría resolverse en una ubicación no deseada (se resuelve manualmente por el PATH, pero la comprobación `-version` se lanza con el nombre suelto).
 12. **No se ha ejecutado `cargo audit` ni `cargo deny`** (no instalados en este entorno).
 
 Procedimiento: varios cambios (p. ej. el selector de vídeo, la serialización de checkpoints, la carpeta de intermedios) se implementaron tras una aprobación general del dueño ("continúa", "ok") y no con una propuesta individual previa, que es lo que pide `POLITICAS.md` §5.
