@@ -65,3 +65,15 @@ async fn pagina_sin_video_da_error_claro() {
         .unwrap_err();
     assert!(err.to_string().contains("vídeo"), "{err}");
 }
+
+#[tokio::test]
+async fn sin_python_configurado_el_error_indica_setup() {
+    let opts = ProbeOptions {
+        python: None,
+        cookies: None,
+    };
+    let err = video::probe("http://127.0.0.1:9/", &opts)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("setup"), "{err}");
+}

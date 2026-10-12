@@ -4,18 +4,30 @@
 //! - Sin argumentos: modo servicio (lo ejecuta el navegador).
 //! - `register [--extension-id <id>] [--firefox-id <id>]`: escribe los manifiestos y los registra.
 //! - `unregister`: quita el registro.
+//! - `setup`: crea el entorno de yt-dlp (Python 3.10+ y yt-dlp fijado por hash).
+//! - `status`: indica si el entorno de vídeo está listo.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use w11dl::native;
 use w11dl::register;
+use w11dl::runtime;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("register") => finish(run_register(&args)),
+        Some("setup") => finish(
+            runtime::setup(&runtime::data_dir())
+                .map(|st| st.message)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        ),
+        Some("status") => {
+            let st = runtime::check(&runtime::data_dir());
+            finish(Ok(st.message))
+        }
         Some("unregister") => {
             finish(register::unregister(&manifest_dir()).map(|()| "Registro eliminado.".into()))
         }

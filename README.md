@@ -56,7 +56,13 @@ w11dl-host.exe unregister                                     # quita el registr
 w11dl <URL_PAGINA> --video [--python ruta\a\python.exe] [--cookies cookies.txt] [-c 8]
 ```
 
-- **Dependencia**: Python 3.10+ con `yt-dlp==2026.08.19` (`pip install yt-dlp==2026.08.19`). Por defecto usa `W11DL_PYTHON` o `python`.
+`--python` solo hace falta si quieres usar otro entorno; por defecto se usa el que creó `setup`.
+
+```
+```
+
+- **Preparación (una vez)**: `w11dl-host.exe setup`. Busca Python 3.10+, crea un entorno propio en `%LOCALAPPDATA%\W11DownloaderPro` e instala yt-dlp `2026.8.19` verificando sus hashes SHA-256 (solo wheels, sin caché). `w11dl-host.exe status` indica si está listo. No depende del PATH ni de instalaciones previas.
+- **Actualizar yt-dlp**: cambia la versión y los hashes en `packaging/requirements.lock` y vuelve a ejecutar `setup`.
 - **Qué elige**: formatos HTTP/HTTPS directos (mp4, webm, mkv, mov) con vídeo, priorizando los que traen audio y después la resolución más alta.
 - **Qué descarta**: contenido con DRM y streams segmentados HLS/DASH (previstos para la fase 2).
 - **Cookies**: nunca por defecto. Solo con `--cookies`, con un archivo Netscape de tu propia sesión. Usarlas puede llevar a bloqueo de cuenta en algunos sitios; la responsabilidad es del usuario.

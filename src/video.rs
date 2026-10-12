@@ -59,10 +59,10 @@ pub struct ProbeOptions {
 
 /// Consulta yt-dlp y devuelve el mejor formato directo sin DRM.
 pub async fn probe(page: &str, opts: &ProbeOptions) -> Result<Choice> {
-    let python = opts
-        .python
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("python"));
+    // Sin intérprete configurado no se adivina: un `python` del PATH sin yt-dlp daría errores confusos.
+    let python = opts.python.clone().ok_or_else(|| {
+        Error::Video("yt-dlp no está preparado: ejecuta w11dl-host setup o indica --python".into())
+    })?;
     let mut cmd = Command::new(&python);
     cmd.arg("-m").arg("yt_dlp").args([
         "--dump-single-json",
@@ -83,7 +83,12 @@ pub async fn probe(page: &str, opts: &ProbeOptions) -> Result<Choice> {
     let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
         .await
         .map_err(|_| Error::Video("yt-dlp tardó demasiado".into()))?
-        .map_err(|e| Error::Video(format!("no se pudo ejecutar yt-dlp: {e}")))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                Error::Video("el Python configurado no existe: ejecuta w11dl-host setup".into())
+            }
+            _ => Error::Video(format!("no se pudo ejecutar yt-dlp: {e}")),
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr
@@ -163,9 +168,12 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Ruta de Python por defecto cuando no se indica: la variable `W11DL_PYTHON`, si existe.
+/// Python con yt-dlp por defecto: `W11DL_PYTHON` si existe (para desarrollo), o el entorno que
+/// creó `w11dl-host setup`.
 pub fn default_python() -> Option<PathBuf> {
-    std::env::var_os("W11DL_PYTHON").map(PathBuf::from)
+    std::env::var_os("W11DL_PYTHON")
+        .map(PathBuf::from)
+        .or_else(crate::runtime::configured_python)
 }
 
 #[cfg(test)]

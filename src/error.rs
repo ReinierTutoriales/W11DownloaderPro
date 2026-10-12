@@ -38,6 +38,9 @@ pub enum Error {
     #[error("vídeo: {0}")]
     Video(String),
 
+    #[error("preparación: {0}")]
+    Setup(String),
+
     #[error("hash SHA-256 no coincide: esperado {expected}, obtenido {actual}")]
     HashMismatch { expected: String, actual: String },
 
