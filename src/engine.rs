@@ -262,22 +262,26 @@ async fn segmented(
         progress: opts.progress.clone(),
         max_attempts: opts.max_attempts.max(1),
         rx_bytes: AtomicU64::new(0),
-        limit: AtomicUsize::new(0),
+        live: AtomicUsize::new(0),
+        retire: AtomicUsize::new(0),
+        retry: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        refusals: AtomicUsize::new(0),
     });
 
     let mut set = JoinSet::new();
     let mut controller =
         plan::Controller::with_start(max_workers, plan::start_connections(total, max_workers));
-    let mut spawned = 0usize;
-    let mut peak = controller.conns();
-    shared.limit.store(controller.conns(), Ordering::Relaxed);
-    spawn_up_to(&mut set, &shared, &mut spawned, controller.conns());
+    // Tope de un servidor que rechaza conexiones mientras sirve otras.
+    let mut ceiling = plan::Ceiling::new(max_workers);
+    let mut refusals_seen = 0usize;
+    let began = Instant::now();
+    apply_target(&mut set, &shared, controller.conns());
+    let mut peak = shared.live.load(Ordering::Relaxed);
 
     // Ajuste adaptativo: cada muestra de velocidad total decide el número de conexiones.
     let mut sampler = Sampler::new();
     // Diagnóstico opcional: `W11DL_TRACE=1` imprime cada muestra y la decisión del controlador.
     let trace = std::env::var_os("W11DL_TRACE").is_some();
-    let trace_start = Instant::now();
     let mut tick = tokio::time::interval(SAMPLE_EVERY);
     // Si el bucle se retrasa, se pierde el tick en vez de recuperarlo en ráfaga con ventanas diminutas.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -286,7 +290,16 @@ async fn segmented(
         tokio::select! {
             joined = set.join_next() => {
                 match joined {
-                    None => break,
+                    None => {
+                        // Sin trabajadores pero con trabajo (p. ej. un fragmento devuelto tras un
+                        // rechazo): se relanza uno en vez de dar la descarga por interrumpida.
+                        if control.state() == RUN && shared.has_work() {
+                            let target = controller.conns().min(ceiling.cap());
+                            apply_target(&mut set, &shared, target);
+                            continue;
+                        }
+                        break;
+                    }
                     Some(Ok(Ok(()))) => {}
                     Some(Ok(Err(e))) => {
                         set.abort_all();
@@ -298,25 +311,40 @@ async fn segmented(
                     }
                 }
             }
-            _ = tick.tick(), if !controller.settled() => {
-                let Some(rate) = sampler.sample(shared.rx_bytes.load(Ordering::Relaxed)) else {
-                    continue;
-                };
-                let conns_before = controller.conns();
-                let step = controller.observe(rate);
-                if trace {
-                    eprintln!(
-                        "[trace] t={:.2}s tasa={:.1}MB/s conexiones={} -> {:?}",
-                        trace_start.elapsed().as_secs_f64(),
-                        rate / 1e6,
-                        conns_before,
-                        step
-                    );
+            _ = tick.tick() => {
+                let now_ms = began.elapsed().as_millis() as u64;
+                let mut changed = false;
+                let refusals = shared.refusals.load(Ordering::Relaxed);
+                if refusals > refusals_seen {
+                    refusals_seen = refusals;
+                    ceiling.on_refusal(shared.live.load(Ordering::Relaxed), now_ms);
+                    changed = true;
                 }
-                if let plan::Step::Set(n) = step {
-                    shared.limit.store(n, Ordering::Relaxed);
-                    spawn_up_to(&mut set, &shared, &mut spawned, n);
-                    peak = peak.max(n);
+                if ceiling.tick(now_ms) {
+                    changed = true;
+                }
+                if !controller.settled() {
+                    if let Some(rate) = sampler.sample(shared.rx_bytes.load(Ordering::Relaxed)) {
+                        let conns_before = controller.conns();
+                        let step = controller.observe(rate);
+                        if trace {
+                            eprintln!(
+                                "[trace] t={:.2}s tasa={:.1}MB/s conexiones={} tope={} -> {:?}",
+                                began.elapsed().as_secs_f64(),
+                                rate / 1e6,
+                                conns_before,
+                                ceiling.cap(),
+                                step
+                            );
+                        }
+                        if matches!(step, plan::Step::Set(_)) {
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    apply_target(&mut set, &shared, controller.conns().min(ceiling.cap()));
+                    peak = peak.max(shared.live.load(Ordering::Relaxed));
                 }
             }
         }
@@ -343,7 +371,7 @@ async fn segmented(
         mode: Mode::Segmented {
             chunks: chunk_count,
             connections: peak,
-            settled: controller.conns(),
+            settled: controller.conns().min(ceiling.cap()),
         },
     }))
 }
@@ -367,23 +395,82 @@ struct Shared {
     /// Bytes recibidos de la red (continuo, al llegar cada bloque). Alimenta la medición de velocidad
     /// del controlador; no es el progreso confirmado, que cuenta fragmentos completados.
     rx_bytes: AtomicU64,
-    /// Número de trabajadores que deben seguir activos. Lo fija el controlador.
-    limit: AtomicUsize,
+    /// Trabajadores vivos ahora.
+    live: AtomicUsize,
+    /// Trabajadores que deben retirarse tras su fragmento actual (lo fija el motor al bajar el objetivo).
+    retire: AtomicUsize,
+    /// Fragmentos devueltos tras un rechazo del servidor: cualquier trabajador libre los toma antes
+    /// que los nuevos, para que no queden retenidos por la espera de reintento de otro.
+    retry: std::sync::Mutex<std::collections::VecDeque<Chunk>>,
+    /// Rechazos del servidor (403, 429 o 503) que retiraron una conexión.
+    refusals: AtomicUsize,
 }
 
-/// Lanza trabajadores hasta tener `target`. Los que quedan por encima del límite salen solos.
-fn spawn_up_to(
-    set: &mut JoinSet<Result<()>>,
-    shared: &Arc<Shared>,
-    spawned: &mut usize,
-    target: usize,
-) {
-    while *spawned < target {
-        let id = *spawned;
-        let shared = Arc::clone(shared);
-        set.spawn(async move { run_worker(shared, id).await });
-        *spawned += 1;
+impl Shared {
+    /// Siguiente fragmento: primero los devueltos, después los nuevos por orden.
+    fn take_chunk(&self) -> Option<Chunk> {
+        let returned = self
+            .retry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        if returned.is_some() {
+            return returned;
+        }
+        let slot = self.cursor.fetch_add(1, Ordering::Relaxed);
+        self.pending.get(slot).copied()
     }
+
+    /// Si queda algún fragmento por tomar (nuevo o devuelto).
+    fn has_work(&self) -> bool {
+        self.cursor.load(Ordering::Relaxed) < self.pending.len()
+            || !self
+                .retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+}
+
+/// Descuenta un trabajador vivo al terminar su tarea, sea cual sea la forma de salir.
+struct LiveGuard(Arc<Shared>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Resultado de pedir un fragmento: sus datos, o el servidor rechazó esta conexión.
+enum Fetched {
+    Data(Bytes),
+    Refused,
+}
+
+/// Ajusta los trabajadores vivos al objetivo: lanza los que faltan (si queda trabajo) o marca
+/// cuántos deben retirarse tras su fragmento actual.
+fn apply_target(set: &mut JoinSet<Result<()>>, shared: &Arc<Shared>, target: usize) {
+    let target = target.max(1);
+    let live = shared.live.load(Ordering::Relaxed);
+    if target > live {
+        shared.retire.store(0, Ordering::Relaxed);
+        if shared.has_work() {
+            for _ in live..target {
+                spawn_worker(set, shared);
+            }
+        }
+    } else {
+        shared.retire.store(live - target, Ordering::Relaxed);
+    }
+}
+
+fn spawn_worker(set: &mut JoinSet<Result<()>>, shared: &Arc<Shared>) {
+    shared.live.fetch_add(1, Ordering::Relaxed);
+    let shared = Arc::clone(shared);
+    set.spawn(async move {
+        let _guard = LiveGuard(Arc::clone(&shared));
+        run_worker(shared).await
+    });
 }
 
 /// Velocidad total medida entre dos muestras. Ignora intervalos sin progreso.
@@ -419,19 +506,38 @@ impl Sampler {
     }
 }
 
-async fn run_worker(shared: Arc<Shared>, id: usize) -> Result<()> {
+async fn run_worker(shared: Arc<Shared>) -> Result<()> {
     loop {
-        // Si el controlador redujo conexiones, este trabajador termina tras su fragmento actual.
-        // Una pausa o cancelación también termina el trabajador tras el fragmento en curso.
-        if id >= shared.limit.load(Ordering::Relaxed) || shared.control.state() != RUN {
+        // Una pausa o cancelación termina el trabajador tras el fragmento en curso.
+        if shared.control.state() != RUN {
             return Ok(());
         }
-        let slot = shared.cursor.fetch_add(1, Ordering::Relaxed);
-        let Some(chunk) = shared.pending.get(slot).copied() else {
+        // Si el motor bajó el objetivo, este trabajador se retira tras su fragmento actual.
+        if shared
+            .retire
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| r.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let Some(chunk) = shared.take_chunk() else {
             return Ok(());
         };
 
-        let data = fetch_with_retry(&shared, chunk).await?;
+        let data = match fetch_with_retry(&shared, chunk).await? {
+            Fetched::Data(data) => data,
+            Fetched::Refused => {
+                // El servidor rechazó esta conexión mientras sirve otras: el fragmento vuelve a la cola
+                // para que lo tome una conexión libre, y esta se retira.
+                shared
+                    .retry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(chunk);
+                shared.refusals.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        };
         let file = Arc::clone(&shared.file);
         let offset = chunk.start;
         tokio::task::spawn_blocking(move || write_at(&file, &data, offset))
@@ -450,7 +556,7 @@ async fn run_worker(shared: Arc<Shared>, id: usize) -> Result<()> {
     }
 }
 
-async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Bytes> {
+async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Fetched> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -464,7 +570,16 @@ async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Bytes> {
         )
         .await
         {
-            Ok(data) => return Ok(data),
+            Ok(data) => return Ok(Fetched::Data(data)),
+            // Rechazo con otras conexiones sirviendo datos: el servidor quiere menos conexiones.
+            // Esperar no ayuda a esta; se devuelve el fragmento y el motor baja el tope.
+            Err(e)
+                if is_refusal(&e)
+                    && shared.rx_bytes.load(Ordering::Relaxed) > 0
+                    && shared.live.load(Ordering::Relaxed) > 1 =>
+            {
+                return Ok(Fetched::Refused);
+            }
             Err(e) if attempt < shared.max_attempts && is_retryable(&e) => {
                 tokio::time::sleep(backoff(attempt)).await;
             }
@@ -632,6 +747,11 @@ async fn remove_if_exists(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// El servidor rechaza esta conexión (no es un fallo de red ni de contenido).
+fn is_refusal(e: &Error) -> bool {
+    matches!(e, Error::RangeIgnored(403 | 429 | 503))
 }
 
 fn is_retryable(e: &Error) -> bool {

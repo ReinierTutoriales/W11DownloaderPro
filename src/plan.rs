@@ -151,6 +151,63 @@ impl Controller {
     }
 }
 
+/// Tiempo sin nuevos rechazos tras el cual el tope sube una conexión.
+pub const CEILING_RECOVER_MS: u64 = 60_000;
+
+/// Tope de conexiones que impone un servidor que rechaza algunas (503, 429 o 403) mientras sirve
+/// datos por otras. Se fija en las conexiones que seguían sirviendo, y sube de una en una cada
+/// `CEILING_RECOVER_MS` sin nuevos rechazos: un servidor que estuvo mal un momento no limita para
+/// siempre una descarga larga, y uno que lo decía en serio cuesta un rechazo por minuto.
+#[derive(Debug, Clone)]
+pub struct Ceiling {
+    max: usize,
+    limit: Option<usize>,
+    since_ms: u64,
+}
+
+impl Ceiling {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            limit: None,
+            since_ms: 0,
+        }
+    }
+
+    /// Un servidor rechazó una conexión mientras servía otras `serving`. El tope solo baja.
+    pub fn on_refusal(&mut self, serving: usize, now_ms: u64) {
+        let cap = serving.max(1).min(self.max);
+        self.limit = Some(self.limit.map_or(cap, |l| l.min(cap)));
+        self.since_ms = now_ms;
+    }
+
+    /// Sube el tope una conexión si pasó el tiempo de recuperación. Devuelve si cambió.
+    pub fn tick(&mut self, now_ms: u64) -> bool {
+        let Some(limit) = self.limit else {
+            return false;
+        };
+        if now_ms.saturating_sub(self.since_ms) < CEILING_RECOVER_MS {
+            return false;
+        }
+        self.since_ms = now_ms;
+        self.limit = if limit + 1 >= self.max {
+            None
+        } else {
+            Some(limit + 1)
+        };
+        true
+    }
+
+    /// Conexiones permitidas ahora.
+    pub fn cap(&self) -> usize {
+        self.limit.unwrap_or(self.max)
+    }
+
+    pub fn is_limited(&self) -> bool {
+        self.limit.is_some()
+    }
+}
+
 /// Tamaño mínimo de fragmento: por debajo de esto el coste de cada petición domina.
 pub const MIN_CHUNK: u64 = 64 * 1024;
 
@@ -493,6 +550,45 @@ mod tests {
                 .take(chunks.len() - 1)
                 .all(|c| c.len() == MIN_CHUNK)
         );
+    }
+
+    #[test]
+    fn el_tope_se_fija_en_las_conexiones_que_seguian_sirviendo() {
+        let mut c = Ceiling::new(8);
+        assert_eq!(c.cap(), 8);
+        c.on_refusal(3, 1_000);
+        assert_eq!(c.cap(), 3);
+        c.on_refusal(2, 2_000);
+        assert_eq!(c.cap(), 2, "un rechazo posterior solo baja el tope");
+        c.on_refusal(5, 3_000);
+        assert_eq!(c.cap(), 2, "nunca sube por un rechazo");
+        c.on_refusal(0, 4_000);
+        assert_eq!(c.cap(), 1, "mínimo una conexión");
+    }
+
+    #[test]
+    fn el_tope_se_recupera_de_una_en_una_cada_minuto() {
+        let mut c = Ceiling::new(4);
+        c.on_refusal(1, 0);
+        assert!(!c.tick(59_000), "aún no ha pasado el minuto");
+        assert_eq!(c.cap(), 1);
+        assert!(c.tick(60_000));
+        assert_eq!(c.cap(), 2);
+        assert!(!c.tick(90_000), "el minuto cuenta desde la última subida");
+        assert!(c.tick(120_000));
+        assert_eq!(c.cap(), 3);
+        assert!(c.tick(180_000));
+        assert!(!c.is_limited(), "al llegar al máximo el tope desaparece");
+        assert_eq!(c.cap(), 4);
+    }
+
+    #[test]
+    fn un_nuevo_rechazo_reinicia_la_espera_de_recuperacion() {
+        let mut c = Ceiling::new(8);
+        c.on_refusal(2, 0);
+        c.on_refusal(2, 50_000);
+        assert!(!c.tick(100_000), "el último rechazo fue hace 50 s");
+        assert!(c.tick(110_000));
     }
 
     #[test]
