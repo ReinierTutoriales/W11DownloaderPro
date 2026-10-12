@@ -5,11 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
-use url::Url;
 use w11dl::crawl::{self, CrawlOptions};
 use w11dl::engine::{DEFAULT_CONNECTIONS, DEFAULT_MAX_CHUNK};
 use w11dl::proxy::ProxyMode;
-use w11dl::{Mode, Options, Report, download, net};
+use w11dl::{Mode, Options, Report, download, naming, net};
 
 /// Descarga acelerada: segmentación por rangos, reanudación, verificación SHA-256,
 /// proxy y rastreo de sitios para capturar archivos.
@@ -146,7 +145,7 @@ async fn run_crawl(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cli.out_dir)?;
     let mut all_ok = true;
     for file in &found.files {
-        let output = cli.out_dir.join(file_name(file));
+        let output = cli.out_dir.join(naming::file_name(file));
         let progress = Arc::new(AtomicU64::new(0));
         let reporter = spawn_reporter(Arc::clone(&progress));
 
@@ -219,43 +218,4 @@ fn default_name(url: &str) -> PathBuf {
         .filter(|s| !s.is_empty())
         .unwrap_or("descarga.bin");
     PathBuf::from(name)
-}
-
-/// Nombre de archivo seguro para Windows a partir de la URL de un archivo rastreado.
-fn file_name(url: &Url) -> String {
-    let raw = url
-        .path_segments()
-        .and_then(|mut s| s.next_back())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("archivo");
-    let decoded = percent_decode(raw);
-    decoded
-        .chars()
-        .map(|c| {
-            if "<>:\"/\\|?*".contains(c) || c.is_control() {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }

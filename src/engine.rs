@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
+use hyper::Uri;
+use hyper::header::HeaderMap;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -37,6 +39,8 @@ pub struct Options {
     /// SHA-256 esperado en hexadecimal minúsculas. Si se indica, el archivo solo se publica si coincide.
     pub sha256: Option<String>,
     pub proxy: ProxyMode,
+    /// Cabeceras adicionales (p. ej. `Cookie`, `Referer`). Solo se envían al host original.
+    pub headers: HeaderMap,
     /// Bytes completados, actualizado en tiempo real por las tareas de descarga.
     pub progress: Option<Arc<AtomicU64>>,
 }
@@ -51,6 +55,7 @@ impl Options {
             max_attempts: DEFAULT_ATTEMPTS,
             sha256: None,
             proxy: ProxyMode::System,
+            headers: HeaderMap::new(),
             progress: None,
         }
     }
@@ -77,15 +82,16 @@ pub struct Report {
 pub async fn download(opts: Options) -> Result<Report> {
     let started = Instant::now();
     let client = net::build_client(opts.connections, &opts.proxy)?;
-    let remote = net::probe(&client, &opts.url).await?;
+    let remote = net::probe(&client, &opts.url, &opts.headers).await?;
+    let headers = headers_for(&opts.url, &remote.url, &opts.headers);
     let part = with_suffix(&opts.output, ".part");
     let state_path = with_suffix(&opts.output, ".part.state");
 
     let transfer = match (remote.ranges, remote.total) {
         (true, Some(total)) if total > 0 => {
-            segmented(&client, &opts, &remote, total, &part, &state_path).await?
+            segmented(&client, &opts, &remote, &headers, total, &part, &state_path).await?
         }
-        _ => single(&client, &opts, &remote, &part).await?,
+        _ => single(&client, &opts, &remote, &headers, &part).await?,
     };
 
     if let Some(expected) = &opts.sha256 {
@@ -123,6 +129,7 @@ async fn segmented(
     client: &HttpClient,
     opts: &Options,
     remote: &Remote,
+    headers: &HeaderMap,
     total: u64,
     part: &Path,
     state_path: &Path,
@@ -155,6 +162,7 @@ async fn segmented(
     let shared = Arc::new(Shared {
         client: client.clone(),
         url: remote.url.clone(),
+        headers: headers.clone(),
         etag: remote.etag.clone(),
         pending,
         cursor: AtomicUsize::new(0),
@@ -205,7 +213,8 @@ async fn segmented(
 /// Estado compartido por las tareas de descarga de una misma transferencia.
 struct Shared {
     client: HttpClient,
-    url: hyper::Uri,
+    url: Uri,
+    headers: HeaderMap,
     etag: Option<String>,
     pending: Vec<Chunk>,
     /// Siguiente índice de `pending` a reclamar. Reparto dinámico: quien termina antes toma más trabajo.
@@ -248,7 +257,15 @@ async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Bytes> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match net::fetch_chunk(&shared.client, &shared.url, chunk, shared.etag.as_deref()).await {
+        match net::fetch_chunk(
+            &shared.client,
+            &shared.url,
+            chunk,
+            shared.etag.as_deref(),
+            &shared.headers,
+        )
+        .await
+        {
             Ok(data) => return Ok(data),
             Err(e) if attempt < shared.max_attempts && is_retryable(&e) => {
                 tokio::time::sleep(backoff(attempt)).await;
@@ -283,9 +300,10 @@ async fn single(
     client: &HttpClient,
     opts: &Options,
     remote: &Remote,
+    headers: &HeaderMap,
     part: &Path,
 ) -> Result<Transfer> {
-    let resp = net::get_full(client, &remote.url).await?;
+    let resp = net::get_full(client, &remote.url, headers).await?;
     let mut body = resp.into_body();
     let mut file = tokio::fs::File::create(part).await?;
 
@@ -416,6 +434,18 @@ fn is_retryable(e: &Error) -> bool {
 
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250u64 << attempt.min(6))
+}
+
+/// Las cabeceras de sesión solo viajan al host original: una redirección a otro dominio no las recibe.
+fn headers_for(original: &str, final_url: &Uri, headers: &HeaderMap) -> HeaderMap {
+    let same_host = net::parse_url(original)
+        .ok()
+        .is_some_and(|u| u.authority() == final_url.authority());
+    if same_host {
+        headers.clone()
+    } else {
+        HeaderMap::new()
+    }
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {

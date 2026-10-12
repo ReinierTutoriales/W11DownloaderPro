@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
+use hyper::header::HeaderMap;
 use hyper::header::{
     ACCEPT_ENCODING, CONTENT_LENGTH, ETAG, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT,
 };
@@ -19,6 +20,17 @@ pub type HttpClient = Client<HttpsConnector<ProxyConnector>, Empty<Bytes>>;
 
 const MAX_REDIRECTS: usize = 10;
 const USER_AGENT_VALUE: &str = concat!("w11dl/", env!("CARGO_PKG_VERSION"));
+
+/// Aplica cabeceras propias de la descarga (p. ej. cookies de la sesión del navegador).
+/// Reemplaza por completo las cabeceras con el mismo nombre, para no duplicar `User-Agent`.
+fn apply_extra<B>(req: &mut Request<B>, extra: &HeaderMap) {
+    for name in extra.keys() {
+        req.headers_mut().remove(name);
+    }
+    for (name, value) in extra {
+        req.headers_mut().append(name, value.clone());
+    }
+}
 
 /// Metadatos del recurso remoto tras sondearlo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,11 +71,12 @@ pub fn parse_url(raw: &str) -> Result<Uri> {
 
 /// Sondea el recurso con `Range: bytes=0-0`. Sigue redirecciones manualmente
 /// para conocer la URL final y evita descargar el cuerpo.
-pub async fn probe(client: &HttpClient, raw: &str) -> Result<Remote> {
+pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<Remote> {
     let mut uri = parse_url(raw)?;
+    let origin = uri.authority().cloned();
 
     for _ in 0..=MAX_REDIRECTS {
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(&uri)
             .header(USER_AGENT, USER_AGENT_VALUE)
@@ -71,6 +84,9 @@ pub async fn probe(client: &HttpClient, raw: &str) -> Result<Remote> {
             .header(RANGE, "bytes=0-0")
             .body(Empty::<Bytes>::new())
             .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        if uri.authority() == origin.as_ref() {
+            apply_extra(&mut req, extra);
+        }
 
         let resp = client.request(req).await?;
         let status = resp.status();
@@ -129,6 +145,7 @@ pub async fn fetch_chunk(
     url: &Uri,
     chunk: Chunk,
     etag: Option<&str>,
+    extra: &HeaderMap,
 ) -> Result<Bytes> {
     let mut builder = Request::builder()
         .method(Method::GET)
@@ -139,9 +156,10 @@ pub async fn fetch_chunk(
     if let Some(tag) = etag {
         builder = builder.header(IF_RANGE, tag);
     }
-    let req = builder
+    let mut req = builder
         .body(Empty::<Bytes>::new())
         .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+    apply_extra(&mut req, extra);
 
     let resp = client.request(req).await?;
     let status = resp.status();
@@ -159,14 +177,19 @@ pub async fn fetch_chunk(
 }
 
 /// Pide el recurso completo en un solo flujo, para servidores sin soporte de rangos.
-pub async fn get_full(client: &HttpClient, url: &Uri) -> Result<Response<Incoming>> {
-    let req = Request::builder()
+pub async fn get_full(
+    client: &HttpClient,
+    url: &Uri,
+    extra: &HeaderMap,
+) -> Result<Response<Incoming>> {
+    let mut req = Request::builder()
         .method(Method::GET)
         .uri(url)
         .header(USER_AGENT, USER_AGENT_VALUE)
         .header(ACCEPT_ENCODING, "identity")
         .body(Empty::<Bytes>::new())
         .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+    apply_extra(&mut req, extra);
 
     let resp = client.request(req).await?;
     if !resp.status().is_success() {

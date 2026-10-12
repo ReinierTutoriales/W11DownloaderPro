@@ -32,3 +32,18 @@ cargo check --target x86_64-pc-windows-gnu --all-targets
 ```
 
 Políticas del proyecto: ver `POLITICAS.md`.
+
+## Host de mensajería nativa (fase 3)
+
+`w11dl-host.exe` recibe las descargas que captura la extensión del navegador.
+
+```
+w11dl-host.exe register --extension-id <id-de-14-letras-a-p>   # escribe el manifiesto y lo registra en Chrome y Edge (HKCU)
+w11dl-host.exe unregister                                     # quita el registro
+```
+
+- Protocolo: mensajes JSON con prefijo de longitud (4 bytes little-endian), según Native Messaging.
+- Orden de entrega: el host responde `accepted` antes de descargar. La extensión solo debe cancelar su descarga del navegador al recibir ese acuse.
+- Solo se aceptan URL `http`/`https` y las cabeceras `Cookie`, `Referer`, `User-Agent` y `Accept-Language`.
+- Las cabeceras de sesión solo se envían al host original; una redirección a otro dominio no las recibe.
+- Las descargas van a `%USERPROFILE%\Downloads` por defecto, con `--out-dir` para cambiarlo. Nunca se sobrescribe un archivo existente: se añade ` (2)`, ` (3)`…

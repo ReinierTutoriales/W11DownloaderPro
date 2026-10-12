@@ -20,6 +20,8 @@ pub struct Site {
     routes: HashMap<String, (String, Vec<u8>)>,
     /// Peticiones recibidas, incluidas las de sondeo.
     pub hits: AtomicUsize,
+    /// Peticiones que llegaron con cabecera `Cookie`.
+    pub with_cookie: AtomicUsize,
 }
 
 /// Arranca un servidor con las rutas dadas: `(ruta, content-type, cuerpo)`.
@@ -32,6 +34,7 @@ pub async fn serve(routes: Vec<(&str, &str, Vec<u8>)>) -> (SocketAddr, Arc<Site>
             .map(|(p, ct, body)| (p.to_owned(), (ct.to_owned(), body)))
             .collect(),
         hits: AtomicUsize::new(0),
+        with_cookie: AtomicUsize::new(0),
     });
 
     let accepting = Arc::clone(&site);
@@ -55,6 +58,9 @@ pub async fn serve(routes: Vec<(&str, &str, Vec<u8>)>) -> (SocketAddr, Arc<Site>
 
 fn handle(site: &Site, req: Request<Incoming>) -> Response<Full<Bytes>> {
     site.hits.fetch_add(1, Ordering::SeqCst);
+    if req.headers().contains_key(hyper::header::COOKIE) {
+        site.with_cookie.fetch_add(1, Ordering::SeqCst);
+    }
     // Con proxy HTTP el cliente envía la URL absoluta; solo interesa la ruta.
     let path = req.uri().path().to_owned();
     let Some((content_type, body)) = site.routes.get(&path) else {

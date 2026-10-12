@@ -1,0 +1,295 @@
+//! Protocolo de mensajería nativa (Native Messaging) con el navegador.
+//!
+//! Cada mensaje es JSON precedido de su longitud en 4 bytes little-endian. El host acusa recibo
+//! (`accepted`) antes de empezar la descarga: el navegador solo debe cancelar su propia descarga
+//! cuando recibe ese acuse, así una descarga nunca se pierde por un fallo de la conexión.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Semaphore, mpsc};
+use url::Url;
+
+use crate::engine::{self, Options};
+use crate::naming;
+use crate::proxy::ProxyMode;
+
+/// Límite de un mensaje entrante, según el protocolo del navegador.
+pub const MAX_INCOMING: usize = 1024 * 1024;
+const MAX_CONCURRENT: usize = 4;
+const PROGRESS_EVERY: Duration = Duration::from_millis(500);
+/// Cabeceras que la extensión puede enviar. Cualquier otra se rechaza.
+const ALLOWED_HEADERS: &[&str] = &["cookie", "referer", "user-agent", "accept-language"];
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Incoming {
+    Ping,
+    Enqueue {
+        id: String,
+        url: String,
+        /// Nombre sugerido por el navegador. Si falta, se deriva de la URL.
+        filename: Option<String>,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Outgoing {
+    Pong,
+    Accepted {
+        id: String,
+        path: String,
+    },
+    Progress {
+        id: String,
+        bytes: u64,
+    },
+    Done {
+        id: String,
+        path: String,
+        bytes: u64,
+    },
+    Error {
+        id: String,
+        message: String,
+    },
+}
+
+/// Lee un mensaje. `Ok(None)` indica que el navegador cerró la conexión.
+pub async fn read_message<R: AsyncRead + Unpin>(input: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_bytes = [0u8; 4];
+    match input.read_exact(&mut len_bytes).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_INCOMING {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mensaje demasiado grande",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    input.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+pub async fn write_message<W: AsyncWrite + Unpin, T: Serialize>(
+    output: &mut W,
+    value: &T,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    let len = u32::try_from(body.len()).map_err(std::io::Error::other)?;
+    output.write_all(&len.to_le_bytes()).await?;
+    output.write_all(&body).await?;
+    output.flush().await
+}
+
+/// Atiende mensajes hasta que el navegador cierra la conexión. Las descargas continúan hasta
+/// terminar; el proceso espera a que terminen antes de salir.
+pub async fn serve<R, W>(mut input: R, mut output: W, out_dir: PathBuf) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+    let writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            write_message(&mut output, &message).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let mut jobs = tokio::task::JoinSet::new();
+
+    while let Some(raw) = read_message(&mut input).await? {
+        match serde_json::from_slice::<Incoming>(&raw) {
+            Ok(Incoming::Ping) => {
+                let _ = tx.send(Outgoing::Pong);
+            }
+            Ok(Incoming::Enqueue {
+                id,
+                url,
+                filename,
+                headers,
+            }) => match prepare(&id, &url, filename.as_deref(), &headers, &out_dir) {
+                Ok(job) => {
+                    let _ = tx.send(Outgoing::Accepted {
+                        id: id.clone(),
+                        path: job.output.display().to_string(),
+                    });
+                    let slots = Arc::clone(&slots);
+                    let tx = tx.clone();
+                    jobs.spawn(async move {
+                        let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+                        run(job, tx).await;
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Outgoing::Error { id, message });
+                }
+            },
+            Err(e) => {
+                let _ = tx.send(Outgoing::Error {
+                    id: String::new(),
+                    message: format!("mensaje no válido: {e}"),
+                });
+            }
+        }
+    }
+
+    while jobs.join_next().await.is_some() {}
+    drop(tx);
+    writer.await.map_err(std::io::Error::other)??;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Job {
+    id: String,
+    url: String,
+    output: PathBuf,
+    headers: HeaderMap,
+}
+
+/// Valida la petición antes de aceptarla: URL web, cabeceras permitidas y nombre seguro.
+fn prepare(
+    id: &str,
+    url: &str,
+    filename: Option<&str>,
+    headers: &HashMap<String, String>,
+    out_dir: &std::path::Path,
+) -> Result<Job, String> {
+    let parsed = Url::parse(url).map_err(|_| format!("URL no válida: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("esquema no permitido: {}", parsed.scheme()));
+    }
+
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        if !ALLOWED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(format!("cabecera no permitida: {name}"));
+        }
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
+        let value = HeaderValue::from_str(value).map_err(|e| e.to_string())?;
+        map.append(name, value);
+    }
+
+    let name = filename
+        .and_then(naming::sanitize)
+        .unwrap_or_else(|| naming::file_name(&parsed));
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let output = naming::unique_path(out_dir, &name);
+
+    Ok(Job {
+        id: id.to_owned(),
+        url: url.to_owned(),
+        output,
+        headers: map,
+    })
+}
+
+async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>) {
+    let progress = Arc::new(AtomicU64::new(0));
+    let reporter = {
+        let progress = Arc::clone(&progress);
+        let tx = tx.clone();
+        let id = job.id.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PROGRESS_EVERY);
+            loop {
+                ticker.tick().await;
+                let bytes = progress.load(Ordering::Relaxed);
+                let _ = tx.send(Outgoing::Progress {
+                    id: id.clone(),
+                    bytes,
+                });
+            }
+        })
+    };
+
+    let mut opts = Options::new(job.url, job.output.clone());
+    opts.headers = job.headers;
+    opts.proxy = ProxyMode::System;
+    opts.progress = Some(Arc::clone(&progress));
+
+    let result = engine::download(opts).await;
+    reporter.abort();
+
+    let message = match result {
+        Ok(report) => Outgoing::Done {
+            id: job.id,
+            path: job.output.display().to_string(),
+            bytes: report.bytes,
+        },
+        Err(e) => Outgoing::Error {
+            id: job.id,
+            message: e.to_string(),
+        },
+    };
+    let _ = tx.send(message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn marco_ida_y_vuelta() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_message(&mut a, &Outgoing::Pong).await.unwrap();
+        let raw = read_message(&mut b).await.unwrap().unwrap();
+        assert_eq!(raw, br#"{"type":"pong"}"#);
+    }
+
+    #[tokio::test]
+    async fn mensaje_demasiado_grande_se_rechaza() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&((MAX_INCOMING as u32) + 1).to_le_bytes())
+            .await
+            .unwrap();
+        assert!(read_message(&mut b).await.is_err());
+    }
+
+    #[test]
+    fn cabecera_no_permitida_se_rechaza() {
+        let dir = tempfile::tempdir().unwrap();
+        let headers = HashMap::from([("X-Evil".to_owned(), "1".to_owned())]);
+        let err = prepare("1", "https://x.test/a.zip", None, &headers, dir.path()).unwrap_err();
+        assert!(err.contains("no permitida"), "{err}");
+    }
+
+    #[test]
+    fn esquema_no_web_se_rechaza() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            prepare("1", "file:///etc/passwd", None, &HashMap::new(), dir.path()).unwrap_err();
+        assert!(err.contains("esquema"), "{err}");
+    }
+
+    #[test]
+    fn nombre_sugerido_no_escapa_del_directorio() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = prepare(
+            "1",
+            "https://x.test/a.zip",
+            Some("..\\..\\evil.exe"),
+            &HashMap::new(),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(job.output.parent().unwrap(), dir.path());
+        assert_eq!(job.output.file_name().unwrap(), "evil.exe");
+    }
+}
