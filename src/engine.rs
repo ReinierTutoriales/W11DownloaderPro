@@ -262,6 +262,9 @@ async fn segmented(
 
     // Ajuste adaptativo: cada muestra de velocidad total decide el número de conexiones.
     let mut sampler = Sampler::new();
+    // Diagnóstico opcional: `W11DL_TRACE=1` imprime cada muestra y la decisión del controlador.
+    let trace = std::env::var_os("W11DL_TRACE").is_some();
+    let trace_start = Instant::now();
     let mut tick = tokio::time::interval(SAMPLE_EVERY);
     tick.tick().await;
     loop {
@@ -284,7 +287,18 @@ async fn segmented(
                 let Some(rate) = sampler.sample(shared.done_bytes.load(Ordering::Relaxed)) else {
                     continue;
                 };
-                if let plan::Step::Set(n) = controller.observe(rate) {
+                let conns_before = controller.conns();
+                let step = controller.observe(rate);
+                if trace {
+                    eprintln!(
+                        "[trace] t={:.2}s tasa={:.1}MB/s conexiones={} -> {:?}",
+                        trace_start.elapsed().as_secs_f64(),
+                        rate / 1e6,
+                        conns_before,
+                        step
+                    );
+                }
+                if let plan::Step::Set(n) = step {
                     shared.limit.store(n, Ordering::Relaxed);
                     spawn_up_to(&mut set, &shared, &mut spawned, n);
                     peak = peak.max(n);
