@@ -2,6 +2,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Conexiones con las que se empieza. Se añaden más solo si la velocidad total lo justifica.
+pub const START_CONNECTIONS: usize = 2;
+/// Ganancia mínima de velocidad total para justificar una conexión más (10 %).
+pub const RAMP_GAIN: f64 = 1.10;
+
+/// Decide cuántas conexiones usar en la siguiente muestra. `rate` y `prev_rate` son velocidades
+/// totales en bytes/s. Si la velocidad no sube lo suficiente, el número se mantiene y el
+/// llamador deja de crecer: más conexiones solo llenan la cola del servidor.
+pub fn next_connections(current: usize, max: usize, prev_rate: f64, rate: f64) -> usize {
+    if current >= max {
+        return current;
+    }
+    if prev_rate <= 0.0 || rate >= prev_rate * RAMP_GAIN {
+        current + 1
+    } else {
+        current
+    }
+}
+
 /// Tamaño mínimo de fragmento: por debajo de esto el coste de cada petición domina.
 pub const MIN_CHUNK: u64 = 64 * 1024;
 
@@ -108,6 +127,26 @@ mod tests {
         }
         assert_eq!(expected_start, total);
         assert_eq!(chunks.iter().map(Chunk::len).sum::<u64>(), total);
+    }
+
+    #[test]
+    fn conexiones_crecen_mientras_la_velocidad_sube() {
+        assert_eq!(
+            next_connections(2, 8, 0.0, 5.0e6),
+            3,
+            "primera muestra válida: crece"
+        );
+        assert_eq!(next_connections(3, 8, 5.0e6, 6.0e6), 4, "+20 %: crece");
+        assert_eq!(
+            next_connections(4, 8, 6.0e6, 6.2e6),
+            4,
+            "+3 %: no justifica otra"
+        );
+        assert_eq!(
+            next_connections(8, 8, 1.0e6, 9.0e6),
+            8,
+            "nunca supera el máximo"
+        );
     }
 
     #[test]

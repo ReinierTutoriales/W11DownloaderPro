@@ -28,6 +28,8 @@ const DEFAULT_ATTEMPTS: u32 = 4;
 /// Cada cuántos fragmentos completados se sincroniza el archivo y se persiste el estado.
 const FLUSH_EVERY: usize = 16;
 const HASH_BLOCK: usize = 1 << 20;
+/// Periodo de muestreo para decidir cuántas conexiones usar.
+const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -157,7 +159,8 @@ async fn segmented(
         .filter(|c| !state.done[c.index])
         .collect();
     let chunk_count = state.done.len();
-    let workers = opts.connections.clamp(1, pending.len().max(1));
+    // Máximo de conexiones: no más que fragmentos pendientes.
+    let max_workers = opts.connections.clamp(1, pending.len().max(1));
 
     let shared = Arc::new(Shared {
         client: client.clone(),
@@ -172,23 +175,55 @@ async fn segmented(
         state_path: state_path.to_path_buf(),
         progress: opts.progress.clone(),
         max_attempts: opts.max_attempts.max(1),
+        done_bytes: AtomicU64::new(0),
     });
 
     let mut set = JoinSet::new();
-    for _ in 0..workers {
-        let shared = Arc::clone(&shared);
-        set.spawn(async move { run_worker(shared).await });
+    let mut active = plan::START_CONNECTIONS.min(max_workers);
+    let mut peak = active;
+    for _ in 0..active {
+        spawn_worker(&mut set, &shared);
     }
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                set.abort_all();
-                return Err(e);
+
+    // Crecimiento adaptativo: cada muestra compara la velocidad total con la anterior.
+    let mut sampler = Sampler::new();
+    let mut ramping = active < max_workers;
+    let mut tick = tokio::time::interval(SAMPLE_EVERY);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    None => break,
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(e))) => {
+                        set.abort_all();
+                        return Err(e);
+                    }
+                    Some(Err(join)) => {
+                        set.abort_all();
+                        return Err(io::Error::other(join).into());
+                    }
+                }
             }
-            Err(join) => {
-                set.abort_all();
-                return Err(io::Error::other(join).into());
+            _ = tick.tick(), if ramping => {
+                let Some(rate) = sampler.sample(shared.done_bytes.load(Ordering::Relaxed)) else {
+                    continue;
+                };
+                let next = plan::next_connections(active, max_workers, sampler.prev_rate(), rate);
+                sampler.commit(rate);
+                if next > active {
+                    for _ in active..next {
+                        spawn_worker(&mut set, &shared);
+                    }
+                    active = next;
+                    peak = peak.max(active);
+                } else {
+                    ramping = false;
+                }
+                if active >= max_workers {
+                    ramping = false;
+                }
             }
         }
     }
@@ -205,7 +240,7 @@ async fn segmented(
         resumed,
         mode: Mode::Segmented {
             chunks: chunk_count,
-            connections: workers,
+            connections: peak,
         },
     })
 }
@@ -225,6 +260,49 @@ struct Shared {
     state_path: PathBuf,
     progress: Option<Arc<AtomicU64>>,
     max_attempts: u32,
+    /// Bytes completados en esta ejecución; alimenta la medición del crecimiento adaptativo.
+    done_bytes: AtomicU64,
+}
+
+fn spawn_worker(set: &mut JoinSet<Result<()>>, shared: &Arc<Shared>) {
+    let shared = Arc::clone(shared);
+    set.spawn(async move { run_worker(shared).await });
+}
+
+/// Velocidad total medida entre dos muestras. Ignora intervalos sin progreso.
+struct Sampler {
+    last_bytes: u64,
+    last_at: Instant,
+    prev_rate: f64,
+}
+
+impl Sampler {
+    fn new() -> Self {
+        Self {
+            last_bytes: 0,
+            last_at: Instant::now(),
+            prev_rate: 0.0,
+        }
+    }
+
+    fn sample(&mut self, bytes: u64) -> Option<f64> {
+        if bytes == self.last_bytes {
+            return None;
+        }
+        let elapsed = self.last_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let rate = (bytes - self.last_bytes) as f64 / elapsed;
+        self.last_bytes = bytes;
+        self.last_at = Instant::now();
+        Some(rate)
+    }
+
+    fn prev_rate(&self) -> f64 {
+        self.prev_rate
+    }
+
+    fn commit(&mut self, rate: f64) {
+        self.prev_rate = rate;
+    }
 }
 
 async fn run_worker(shared: Arc<Shared>) -> Result<()> {
@@ -244,6 +322,7 @@ async fn run_worker(shared: Arc<Shared>) -> Result<()> {
         if let Some(p) = &shared.progress {
             p.fetch_add(chunk.len(), Ordering::Relaxed);
         }
+        shared.done_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
 
         shared.state.lock().await.done[chunk.index] = true;
         if shared.unflushed.fetch_add(1, Ordering::Relaxed) + 1 >= FLUSH_EVERY {

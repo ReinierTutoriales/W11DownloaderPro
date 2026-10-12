@@ -160,10 +160,15 @@ async fn segmentada_produce_archivo_identico_al_original() {
     assert_eq!(std::fs::read(&out).unwrap(), data);
     assert_eq!(report.bytes, data.len() as u64);
     assert_eq!(report.resumed, 0);
-    assert!(matches!(
-        report.mode,
-        Mode::Segmented { connections: 4, .. }
-    ));
+    match report.mode {
+        Mode::Segmented { connections, .. } => {
+            assert!(
+                (1..=4).contains(&connections),
+                "pico fuera de rango: {connections}"
+            );
+        }
+        other => panic!("se esperaba descarga segmentada: {other:?}"),
+    }
     assert!(server.chunk_requests.load(Ordering::SeqCst) > 1);
     assert!(!dir.path().join("archivo.bin.part").exists());
     assert!(!dir.path().join("archivo.bin.part.state").exists());
