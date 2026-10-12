@@ -122,10 +122,22 @@
     return DOWNLOAD_TYPES.includes(type);
   }
 
+  // Solo las peticiones GET se pueden repetir: el host vuelve a pedir la URL con GET. Una descarga que
+  // nace de un POST (formularios) depende del cuerpo enviado y la debe bajar el propio navegador.
+  // Sin método conocido no se intercepta.
+  function isGetRequest(details) {
+    return Boolean(details) && typeof details.method === "string" && details.method.toUpperCase() === "GET";
+  }
+
   // Decide si una respuesta debe interceptarse. `enabled` debe ser `true` explícitamente:
   // mientras la configuración no ha cargado, no se captura nada.
   function shouldIntercept(details, enabled) {
-    return enabled === true && isWebUrl(details && details.url) && isDownloadResponse(details);
+    return (
+      enabled === true &&
+      isGetRequest(details) &&
+      isWebUrl(details && details.url) &&
+      isDownloadResponse(details)
+    );
   }
 
   function newId() {
@@ -250,6 +262,7 @@
     headerValue,
     filenameFromDisposition,
     isDownloadResponse,
+    isGetRequest,
     shouldIntercept,
     newId,
     enqueueMessage,

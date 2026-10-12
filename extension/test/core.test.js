@@ -42,8 +42,8 @@ test("sin nombre utilizable cae a un nombre por defecto", () => {
 });
 
 test("intercepta solo navegaciones que son descargas, con captura activa", () => {
-  const attach = { type: "main_frame", url: "https://x.test/a.zip", responseHeaders: [{ name: "Content-Disposition", value: 'attachment; filename="a.zip"' }] };
-  const binary = { type: "main_frame", url: "https://x.test/b.bin", responseHeaders: [{ name: "content-type", value: "application/octet-stream" }] };
+  const attach = { type: "main_frame", method: "GET", url: "https://x.test/a.zip", responseHeaders: [{ name: "Content-Disposition", value: 'attachment; filename="a.zip"' }] };
+  const binary = { type: "main_frame", method: "GET", url: "https://x.test/b.bin", responseHeaders: [{ name: "content-type", value: "application/octet-stream" }] };
   assert.equal(core.shouldIntercept(attach, true), true);
   assert.equal(core.shouldIntercept(binary, true), true);
   assert.equal(core.shouldIntercept(attach, false), false);
@@ -52,8 +52,21 @@ test("intercepta solo navegaciones que son descargas, con captura activa", () =>
   assert.equal(core.shouldIntercept({ ...attach, url: "blob:https://x.test/1" }, true), false);
 });
 
+test("una descarga que nace de un POST (u otro método) no se intercepta", () => {
+  const attach = { type: "main_frame", method: "GET", url: "https://x.test/a.zip", responseHeaders: [{ name: "Content-Disposition", value: "attachment" }] };
+  assert.equal(core.shouldIntercept(attach, true), true);
+  for (const method of ["POST", "PUT", "HEAD", "post", "", undefined, null, 5]) {
+    assert.equal(core.shouldIntercept({ ...attach, method }, true), false, `método ${String(method)}`);
+  }
+  assert.equal(core.shouldIntercept({ ...attach, method: "get" }, true), true, "el método no distingue mayúsculas");
+  const sinMetodo = { ...attach };
+  delete sinMetodo.method;
+  assert.equal(core.shouldIntercept(sinMetodo, true), false, "sin método conocido no se intercepta");
+  assert.equal(core.isGetRequest(null), false);
+});
+
 test("un PDF que se muestra en la pestaña no se intercepta sin adjunto", () => {
-  const inline = { type: "main_frame", url: "https://x.test/d.pdf", responseHeaders: [{ name: "Content-Type", value: "application/pdf" }] };
+  const inline = { type: "main_frame", method: "GET", url: "https://x.test/d.pdf", responseHeaders: [{ name: "Content-Type", value: "application/pdf" }] };
   assert.equal(core.shouldIntercept(inline, true), false);
   const attached = { ...inline, responseHeaders: [...inline.responseHeaders, { name: "Content-Disposition", value: "attachment" }] };
   assert.equal(core.shouldIntercept(attached, true), true);

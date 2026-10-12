@@ -76,7 +76,7 @@ Sin ffmpeg no se delega ni se une (explica la dependencia con enlace).
 | Conjunto | Resultado de la última ejecución |
 |---|---|
 | Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 131 pasan, 0 fallan |
-| Extensión (`npm test`) | 23 pasan, 1 omitida (vídeo, requiere `W11DL_PYTHON`) |
+| Extensión (`npm test`) | 24 pasan, 1 omitida (vídeo, requiere `W11DL_PYTHON`) |
 | Botón en Chromium con Playwright (`test/video-button.dom.js`) | 6 comprobaciones OK |
 | `cargo clippy --all-targets -- -D warnings` | sin avisos |
 | `cargo check --target x86_64-pc-windows-gnu --all-targets` | compila |
@@ -96,7 +96,7 @@ Integración real: servidores locales con rangos, lentitud, rechazos, enlace rev
 ## 7. Defectos y desviaciones conocidos (revisar primero)
 
 1. **Reanudación por tamaño sin validadores** contradice la letra de `POLITICAS.md` §7.3 ("validación del contenido"). Un servidor sin ETag ni `Last-Modified` que cambie el archivo manteniendo el tamaño produciría un archivo mezclado. Mitigación: `--sha256`. Decisión pendiente: mantener o volver a no reanudar sin validador.
-2. **Descargas por POST se rompen:** la extensión cancela la navegación y el host pide la URL con GET. Falta filtrar por método (`details.method === "GET"`).
+2. **~~Descargas por POST se rompían~~ (corregido):** `shouldIntercept` solo intercepta peticiones GET; POST y cualquier otro método (o un método desconocido) los baja el propio navegador. Cubierto por prueba unitaria y validado por mutación. No probado en Firefox real: depende de que `details.method` llegue en `onHeadersReceived`, que la documentación de la API de WebExtensions da como campo estándar.
 3. **Solo se capturan navegaciones principales** (`main_frame`): descargas por `fetch`, `XHR`, `blob:` o iframes no se capturan.
 4. **Autenticación HTTP o por certificado no viaja**; solo cookies, `Referer` y `User-Agent`.
 5. **"En curso" engañoso:** una descarga que espera turno (más de 4) ya figura en curso.

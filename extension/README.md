@@ -37,6 +37,8 @@ La extensión queda activa hasta cerrar Firefox. Para una instalación permanent
 
 No se envía nada a servidores de terceros. Todo el tráfico va del navegador al host en tu equipo, y del host a los servidores que indiques.
 
+Solo se capturan navegaciones por **GET**: una descarga que nace de un POST (formularios) la baja el propio navegador, porque el host no puede repetir el cuerpo enviado.
+
 ## Botón sobre los vídeos
 
 Al pasar el puntero por un vídeo aparece **⬇ Descargar vídeo** en su esquina superior derecha. Un clic lo envía al acelerador: un archivo directo (`.mp4`, `.webm`…) va por el motor con las cookies de la sesión; el resto (YouTube, `blob:`, reproductores incrustados) se manda como página a yt-dlp. Nunca se descarga nada sin ese clic.
