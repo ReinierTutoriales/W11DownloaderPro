@@ -119,11 +119,24 @@ fn select(info: Info) -> Result<Choice> {
         candidates.push(info.single);
     }
 
-    let best = candidates
+    let direct: Vec<&Format> = candidates.iter().filter(|f| is_direct_video(f)).collect();
+    // Un archivo sin sonido no es lo que el usuario espera: nunca se elige en silencio.
+    let best = direct
         .iter()
-        .filter(|f| is_direct_video(f))
-        .max_by_key(|f| (has_audio(f), f.height.unwrap_or(0)))
-        .ok_or_else(|| Error::Video("no hay un formato de vídeo directo sin DRM".into()))?;
+        .filter(|f| has_audio(f))
+        .max_by_key(|f| f.height.unwrap_or(0))
+        .copied()
+        .ok_or_else(|| {
+            if direct.is_empty() {
+                Error::Video("no hay un formato de vídeo directo sin DRM".into())
+            } else {
+                Error::Video(
+                    "este vídeo entrega imagen y sonido por separado; unirlos requiere ffmpeg \
+                     y esa función aún no está disponible"
+                        .into(),
+                )
+            }
+        })?;
 
     let url = best.url.clone().unwrap_or_default();
     let ext = best.ext.clone().unwrap_or_else(|| "mp4".into());
@@ -219,6 +232,21 @@ mod tests {
             ]}"#,
         ));
         assert!(matches!(r, Err(Error::Video(_))), "{r:?}");
+    }
+
+    #[test]
+    fn nunca_elige_en_silencio_un_vídeo_sin_sonido() {
+        // Como YouTube: imagen y sonido en formatos separados.
+        let r = select(info(
+            r#"{"title":"x","formats":[
+                {"url":"https://x.test/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"none","height":1080},
+                {"url":"https://x.test/a.m4a","ext":"m4a","protocol":"https","vcodec":"none","acodec":"mp4a"}
+            ]}"#,
+        ));
+        let Err(Error::Video(message)) = r else {
+            panic!("debía fallar, no devolver un vídeo mudo: {r:?}");
+        };
+        assert!(message.contains("por separado"), "{message}");
     }
 
     #[test]

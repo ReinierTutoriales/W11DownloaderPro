@@ -153,10 +153,7 @@ mod tests {
 
         let loaded = Registry::load(dir.path());
         let states: Vec<State> = loaded.records().into_iter().map(|r| r.state).collect();
-        assert_eq!(
-            states,
-            vec![State::Interrupted, State::Paused, State::Done]
-        );
+        assert_eq!(states, vec![State::Interrupted, State::Paused, State::Done]);
     }
 
     #[test]
