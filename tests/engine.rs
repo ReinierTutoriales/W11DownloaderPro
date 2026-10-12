@@ -449,19 +449,80 @@ async fn recurso_cambiado_en_el_servidor_no_se_reanuda() {
 }
 
 #[tokio::test]
-async fn servidor_sin_validadores_reanuda_por_tamano() {
+async fn servidor_sin_validadores_no_reanuda_sin_sha256() {
     let data = payload(2 * 1024 * 1024);
     let (addr, server) = start_with(data.clone(), true, 0, None, None).await;
     let dir = tempfile::tempdir().unwrap();
     let url = format!("http://{addr}/file");
-    let (opts, chunks, half) =
+    let (opts, chunks, _) =
         interrupted(dir.path(), "sinval.bin", &data, &url, Validators::default());
 
     let report = download(opts).await.unwrap();
 
-    assert!(report.resumed > 0, "debe reanudar aunque no haya ETag");
-    assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks - half);
+    assert_eq!(
+        report.resumed, 0,
+        "sin validadores ni hash, no se fía del parcial"
+    );
+    assert_eq!(
+        server.chunk_requests.load(Ordering::SeqCst),
+        chunks,
+        "baja todo de nuevo"
+    );
     assert_eq!(std::fs::read(dir.path().join("sinval.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn servidor_sin_validadores_reanuda_si_hay_sha256() {
+    let data = payload(2 * 1024 * 1024);
+    let (addr, server) = start_with(data.clone(), true, 0, None, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let (mut opts, chunks, half) = interrupted(
+        dir.path(),
+        "conhash.bin",
+        &data,
+        &url,
+        Validators::default(),
+    );
+    opts.sha256 = Some(sha256_hex(&data));
+
+    let report = download(opts).await.unwrap();
+
+    assert!(
+        report.resumed > 0,
+        "con SHA-256 el resultado se verifica: se puede reanudar"
+    );
+    assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks - half);
+    assert_eq!(std::fs::read(dir.path().join("conhash.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn reanudar_sin_validadores_un_archivo_cambiado_lo_detecta_el_hash() {
+    // El servidor cambió el contenido manteniendo el tamaño; el parcial viene de la versión anterior.
+    let old = payload(2 * 1024 * 1024);
+    let mut new = old.clone();
+    for byte in new.iter_mut().take(1000) {
+        *byte ^= 0xFF;
+    }
+    let (addr, _server) = start_with(new.clone(), true, 0, None, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let (mut opts, _, _) = interrupted(
+        dir.path(),
+        "cambiado2.bin",
+        &old,
+        &url,
+        Validators::default(),
+    );
+    opts.sha256 = Some(sha256_hex(&new));
+
+    let err = download(opts).await.unwrap_err();
+
+    assert!(matches!(err, Error::HashMismatch { .. }), "{err}");
+    assert!(
+        !dir.path().join("cambiado2.bin").exists(),
+        "no se publica un archivo mezclado"
+    );
 }
 
 #[tokio::test]

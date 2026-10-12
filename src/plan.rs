@@ -336,6 +336,10 @@ impl Validators {
     }
 }
 
+fn is_weak(tag: &str) -> bool {
+    tag.trim().starts_with("W/")
+}
+
 /// `ETag` sin el prefijo débil ni espacios, para comparar el recurso (no para `If-Range`).
 fn etag_core(tag: &str) -> &str {
     tag.trim().trim_start_matches("W/")
@@ -370,21 +374,35 @@ impl State {
 
     /// Indica si este estado sigue siendo válido para el recurso actual.
     ///
-    /// El tamaño y la URL deben coincidir siempre (prueba). Cada validador presente en ambos
-    /// lados debe coincidir (indicio): si cualquiera difiere, el archivo cambió. Si el servidor
-    /// no ofrece validadores comparables, se reanuda por tamaño; con `--sha256` el resultado
-    /// final se verifica igualmente.
-    pub fn matches(&self, url: &str, total: u64, current: &Validators) -> bool {
-        self.url == url
-            && self.total == total
-            && match (&self.etag, &current.etag) {
-                (Some(a), Some(b)) => etag_core(a) == etag_core(b),
-                _ => true,
-            }
-            && match (&self.last_modified, &current.last_modified) {
-                (Some(a), Some(b)) => a.trim() == b.trim(),
-                _ => true,
-            }
+    /// La URL y el tamaño deben coincidir siempre. Si algún validador presente en ambos lados
+    /// difiere, el archivo cambió. Para reanudar hace falta además una verificación del contenido:
+    /// un `ETag` fuerte o un `Last-Modified` presentes en ambos lados y coincidentes. Un `ETag`
+    /// débil no basta (solo promete equivalencia, no los mismos bytes). Sin esa verificación solo se
+    /// reanuda con `allow_unverified`, que el motor activa cuando hay un SHA-256 esperado: el
+    /// resultado final se comprueba y cualquier mezcla se detecta.
+    pub fn matches(
+        &self,
+        url: &str,
+        total: u64,
+        current: &Validators,
+        allow_unverified: bool,
+    ) -> bool {
+        if self.url != url || self.total != total {
+            return false;
+        }
+        let etag = match (&self.etag, &current.etag) {
+            (Some(a), Some(b)) => Some((etag_core(a) == etag_core(b), !is_weak(a) && !is_weak(b))),
+            _ => None,
+        };
+        let modified = match (&self.last_modified, &current.last_modified) {
+            (Some(a), Some(b)) => Some(a.trim() == b.trim()),
+            _ => None,
+        };
+        if etag.is_some_and(|(same, _)| !same) || modified == Some(false) {
+            return false;
+        }
+        let verified = etag == Some((true, true)) || modified == Some(true);
+        verified || allow_unverified
     }
 
     pub fn completed_bytes(&self) -> u64 {
@@ -676,29 +694,71 @@ mod tests {
     #[test]
     fn estado_rechaza_recurso_cambiado() {
         let s = State::new("http://x/a", 100, 10, v(Some("\"v1\""), Some("Mon")));
-        assert!(s.matches("http://x/a", 100, &v(Some("\"v1\""), Some("Mon"))));
-        assert!(!s.matches("http://x/a", 100, &v(Some("\"v2\""), Some("Mon"))));
-        assert!(!s.matches("http://x/a", 100, &v(Some("\"v1\""), Some("Tue"))));
-        assert!(!s.matches("http://x/a", 101, &v(Some("\"v1\""), Some("Mon"))));
-        assert!(!s.matches("http://x/b", 100, &v(Some("\"v1\""), Some("Mon"))));
+        assert!(s.matches("http://x/a", 100, &v(Some("\"v1\""), Some("Mon")), false));
+        for strict in [false, true] {
+            // Un validador distinto invalida el parcial incluso con `allow_unverified`.
+            assert!(!s.matches("http://x/a", 100, &v(Some("\"v2\""), Some("Mon")), strict));
+            assert!(!s.matches("http://x/a", 100, &v(Some("\"v1\""), Some("Tue")), strict));
+            assert!(!s.matches("http://x/a", 101, &v(Some("\"v1\""), Some("Mon")), strict));
+            assert!(!s.matches("http://x/b", 100, &v(Some("\"v1\""), Some("Mon")), strict));
+        }
     }
 
     #[test]
-    fn etag_debil_y_fuerte_del_mismo_recurso_coinciden() {
-        let s = State::new("http://x/a", 100, 10, v(Some("W/\"v1\""), None));
-        assert!(s.matches("http://x/a", 100, &v(Some("\"v1\""), None)));
-        assert!(!s.matches("http://x/a", 100, &v(Some("W/\"v2\""), None)));
-    }
-
-    #[test]
-    fn sin_validadores_comparables_se_reanuda_por_tamano() {
-        let s = State::new("http://x/a", 100, 10, v(None, None));
-        assert!(s.matches("http://x/a", 100, &v(None, None)));
-        assert!(!s.matches("http://x/a", 99, &v(None, None)));
-        // Solo Last-Modified en un lado y ETag en el otro: no hay nada comparable.
+    fn un_solo_validador_comparable_basta_si_es_fuerte() {
+        // ETag fuerte solo, o Last-Modified solo.
+        let s = State::new("http://x/a", 100, 10, v(Some("\"v1\""), None));
+        assert!(s.matches("http://x/a", 100, &v(Some("\"v1\""), None), false));
         let s = State::new("http://x/a", 100, 10, v(None, Some("Mon")));
-        assert!(s.matches("http://x/a", 100, &v(Some("\"e\""), None)));
-        assert!(!s.matches("http://x/a", 100, &v(None, Some("Tue"))));
+        assert!(s.matches("http://x/a", 100, &v(None, Some("Mon")), false));
+        // El servidor añadió otro validador entre medias: el que se puede comparar coincide.
+        assert!(s.matches("http://x/a", 100, &v(Some("\"e\""), Some("Mon")), false));
+    }
+
+    #[test]
+    fn etag_debil_no_verifica_pero_distinto_invalida() {
+        let s = State::new("http://x/a", 100, 10, v(Some("W/\"v1\""), None));
+        assert!(
+            !s.matches("http://x/a", 100, &v(Some("W/\"v1\""), None), false),
+            "débil: no verifica"
+        );
+        assert!(
+            !s.matches("http://x/a", 100, &v(Some("\"v1\""), None), false),
+            "débil de un lado: no verifica"
+        );
+        assert!(
+            s.matches("http://x/a", 100, &v(Some("W/\"v1\""), None), true),
+            "con SHA-256 se permite"
+        );
+        assert!(
+            !s.matches("http://x/a", 100, &v(Some("W/\"v2\""), None), true),
+            "distinto invalida siempre"
+        );
+        // Débil más Last-Modified coincidente sí verifica.
+        let s = State::new("http://x/a", 100, 10, v(Some("W/\"v1\""), Some("Mon")));
+        assert!(s.matches("http://x/a", 100, &v(Some("W/\"v1\""), Some("Mon")), false));
+    }
+
+    #[test]
+    fn sin_verificacion_solo_se_reanuda_si_se_permite() {
+        let s = State::new("http://x/a", 100, 10, v(None, None));
+        assert!(
+            !s.matches("http://x/a", 100, &v(None, None), false),
+            "sin validadores no se reanuda"
+        );
+        assert!(
+            s.matches("http://x/a", 100, &v(None, None), true),
+            "con SHA-256 sí"
+        );
+        assert!(
+            !s.matches("http://x/a", 99, &v(None, None), true),
+            "el tamaño siempre cuenta"
+        );
+        // Validadores de clase distinta en cada lado: nada comparable.
+        let s = State::new("http://x/a", 100, 10, v(None, Some("Mon")));
+        assert!(!s.matches("http://x/a", 100, &v(Some("\"e\""), None), false));
+        assert!(s.matches("http://x/a", 100, &v(Some("\"e\""), None), true));
+        assert!(!s.matches("http://x/a", 100, &v(None, Some("Tue")), true));
     }
 
     #[test]

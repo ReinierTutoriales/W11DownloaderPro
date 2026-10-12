@@ -46,8 +46,8 @@ Versiones fijadas en `Cargo.lock`. Python/yt-dlp: `packaging/requirements.lock` 
 - Un solo guardado de estado a la vez (candado); antes dos checkpoints simultáneos podían fallar con `NotFound`.
 
 ### 4.2 Reanudación (`plan.rs: State`, `Validators`)
-- Estado en `.part.state`. Se reanuda si URL y tamaño coinciden y ningún validador presente en ambos lados (ETag normalizado, `Last-Modified`) difiere.
-- **Sin validadores comparables se reanuda solo por tamaño** (ver 7.1).
+- Estado en `.part.state`. Se reanuda si URL y tamaño coinciden, ningún validador presente en ambos lados difiere y hay **verificación del contenido**: un ETag fuerte o un `Last-Modified` presentes en ambos lados y coincidentes (un ETag débil no basta).
+- **Sin esa verificación no se reanuda** (empieza de cero), salvo que se indique `--sha256`: el hash final detecta cualquier mezcla y el archivo no se publica si no coincide. Cumple `POLITICAS.md` §7.3.
 - `If-Range` usa solo validadores fuertes (RFC 9110 §13.1.5).
 
 ### 4.3 Cola y host (`queue.rs`, `native.rs`)
@@ -75,7 +75,7 @@ Sin ffmpeg no se delega ni se une (explica la dependencia con enlace).
 
 | Conjunto | Resultado de la última ejecución |
 |---|---|
-| Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 131 pasan, 0 fallan |
+| Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 134 pasan, 0 fallan |
 | Extensión (`npm test`) | 24 pasan, 1 omitida (vídeo, requiere `W11DL_PYTHON`) |
 | Botón en Chromium con Playwright (`test/video-button.dom.js`) | 6 comprobaciones OK |
 | `cargo clippy --all-targets -- -D warnings` | sin avisos |
@@ -95,7 +95,7 @@ Integración real: servidores locales con rangos, lentitud, rechazos, enlace rev
 
 ## 7. Defectos y desviaciones conocidos (revisar primero)
 
-1. **Reanudación por tamaño sin validadores** contradice la letra de `POLITICAS.md` §7.3 ("validación del contenido"). Un servidor sin ETag ni `Last-Modified` que cambie el archivo manteniendo el tamaño produciría un archivo mezclado. Mitigación: `--sha256`. Decisión pendiente: mantener o volver a no reanudar sin validador.
+1. **~~Reanudación por tamaño sin validadores~~ (resuelto, opción C):** por defecto no se reanuda sin verificación del contenido; con `--sha256` sí, y un archivo cambiado con el mismo tamaño se detecta por el hash (no se publica). Cubierto por pruebas de integración y validado por mutación en las dos direcciones. Efecto práctico: contra un servidor sin ETag fuerte ni `Last-Modified`, una descarga interrumpida empieza de cero; el host de la extensión no usa `--sha256`, así que se comporta así siempre.
 2. **~~Descargas por POST se rompían~~ (corregido):** `shouldIntercept` solo intercepta peticiones GET; POST y cualquier otro método (o un método desconocido) los baja el propio navegador. Cubierto por prueba unitaria y validado por mutación. No probado en Firefox real: depende de que `details.method` llegue en `onHeadersReceived`, que la documentación de la API de WebExtensions da como campo estándar.
 3. **Solo se capturan navegaciones principales** (`main_frame`): descargas por `fetch`, `XHR`, `blob:` o iframes no se capturan.
 4. **Autenticación HTTP o por certificado no viaja**; solo cookies, `Referer` y `User-Agent`.
@@ -133,7 +133,7 @@ W11DL_TRACE=1 target/release/w11dl <url> -c 8                  # traza del contr
 
 ## 10. Lista sugerida para la auditoría
 
-1. Sección 7, punto 1 (decisión de política) y punto 2 (fallo de corrección).
+1. Sección 7: los puntos 1 y 2 están resueltos; revisar que el código y las pruebas lo confirmen (`plan.rs: State::matches`, `engine.rs`, `tests/engine.rs`).
 2. `extension/manifest.json`: permisos (`<all_urls>`, `webRequestBlocking`, `cookies`, script de contenido en todas las páginas http/https).
 3. `src/native.rs: prepare`: validación de URL, cabeceras y nombre de archivo.
 4. `src/ytdlp.rs`, `src/merge.rs`, `src/video.rs: find_ffmpeg`: ejecución de procesos y rutas.
