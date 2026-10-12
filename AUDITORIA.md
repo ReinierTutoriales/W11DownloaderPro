@@ -84,6 +84,7 @@ Sin ffmpeg no se delega ni se une (explica la dependencia con enlace).
 | Botón en Chromium con Playwright (`test/video-button.dom.js`) | 6 comprobaciones OK |
 | `cargo clippy --all-targets -- -D warnings` | sin avisos |
 | `cargo check --target x86_64-pc-windows-gnu --all-targets` | compila |
+| GitHub Actions en `windows-latest` (compilación MSVC nativa, paquete, `cargo test` completo con yt-dlp.exe y ffmpeg.exe incluidos, `npm test`) | verde en el commit `ec575c8`; primera ejecución real en Windows de todo el motor, la cola, el host, HLS con yt-dlp.exe y la unión con ffmpeg |
 
 Se validaron por mutación (se rompe el código y la prueba debe fallar): `If-Range` débil, copia de fragmentos lentos, detección de DRM del botón, carrera de checkpoints (reproducida 2 de 8 y corregida 12 de 12).
 Integración real: servidores locales con rangos, lentitud, rechazos, enlace revocado; host real vía Node; ffmpeg real; yt-dlp real contra un HLS local.
@@ -116,7 +117,7 @@ Procedimiento: varios cambios (p. ej. el selector de vídeo, la serialización d
 
 ## 8. No verificado
 
-- **Windows 11:** nada se ha ejecutado allí. En particular el registro del host (HKCU) para Firefox, la comunicación stdio, `schtasks` con el XML en UTF-16, el apagado y la suspensión, y `ffmpeg.exe`.
+- **Windows 11 de escritorio:** la CI ejecuta en un runner Windows Server (`windows-latest`) el motor, la cola, el host por canal en memoria, HLS con yt-dlp.exe y la unión con ffmpeg.exe. Sigue sin verificarse allí el registro del host (HKCU) para Firefox, la comunicación stdio real con el navegador, `schtasks` con el XML en UTF-16, el apagado y la suspensión.
 - **Firefox real con las funciones recientes:** el último arnés con Firefox real ejecutó captura y respaldo (versión anterior). El botón de vídeo, el selector de límite, "dejar en espera" y la pantalla completa no se han probado en Firefox.
 - **Sitios reales de vídeo:** solo HLS local. YouTube resolvió formatos pero la descarga devolvió 403 en este entorno (también con el descargador de yt-dlp).
 - **Redes reales:** todas las mediciones son sintéticas.

@@ -2,6 +2,12 @@
 
 Motor de descargas acelerado para Windows 11. Fase 1: HTTP/HTTPS con segmentación por rangos, reanudación y verificación SHA-256.
 
+## Instalación (Windows 11 x64)
+
+Descarga el zip de la última [release](../../releases) y sigue `LEEME-PRUEBA.txt`. El paquete **ya incluye todo** (yt-dlp y ffmpeg en `tools`, verificados por hash): no hay que instalar Python ni nada más. Es una versión de pruebas y los ejecutables no están firmados.
+
+El flujo de GitHub Actions (`.github/workflows/release.yml`) compila en Windows, ejecuta toda la batería de pruebas allí con esas mismas herramientas, empaqueta y publica. Para publicar: *Actions → Compilar, probar y empaquetar → Run workflow* con "Publicar" activado, o subir una etiqueta `v*`.
+
 ## Uso
 
 Descarga directa:
