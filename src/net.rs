@@ -140,12 +140,16 @@ pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<
 
 /// Descarga un fragmento completo. Usa `If-Range` cuando hay validador, para que el servidor
 /// responda con datos inconsistentes (200 completo) en lugar de mezclar versiones del archivo.
+///
+/// Cada bloque recibido se suma a `received` al llegar (no al terminar el fragmento): así la
+/// velocidad medida es continua y las conexiones nuevas aportan desde el primer byte.
 pub async fn fetch_chunk(
     client: &HttpClient,
     url: &Uri,
     chunk: Chunk,
     etag: Option<&str>,
     extra: &HeaderMap,
+    received: &std::sync::atomic::AtomicU64,
 ) -> Result<Bytes> {
     let mut builder = Request::builder()
         .method(Method::GET)
@@ -167,13 +171,30 @@ pub async fn fetch_chunk(
         return Err(Error::RangeIgnored(status.as_u16()));
     }
 
-    let body = resp.into_body().collect().await?.to_bytes();
     let expected = chunk.len();
-    let received = body.len() as u64;
-    if received != expected {
-        return Err(Error::Truncated { expected, received });
+    let mut body = resp.into_body();
+    let mut buf = bytes::BytesMut::with_capacity(expected as usize);
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Ok(data) = frame.into_data() {
+            received.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            buf.extend_from_slice(&data);
+            // Un servidor que envía de más no debe llenar la memoria.
+            if buf.len() as u64 > expected {
+                return Err(Error::Truncated {
+                    expected,
+                    received: buf.len() as u64,
+                });
+            }
+        }
     }
-    Ok(body)
+    if buf.len() as u64 != expected {
+        return Err(Error::Truncated {
+            expected,
+            received: buf.len() as u64,
+        });
+    }
+    Ok(buf.freeze())
 }
 
 /// Pide el recurso completo en un solo flujo, para servidores sin soporte de rangos.

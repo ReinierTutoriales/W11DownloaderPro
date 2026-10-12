@@ -248,8 +248,11 @@ fn print_report(output: &Path, report: &Report) {
         Mode::Segmented {
             chunks,
             connections,
+            settled,
         } => {
-            format!("segmentada ({chunks} fragmentos, {connections} conexiones)")
+            format!(
+                "segmentada ({chunks} fragmentos, pico {connections}, final {settled} conexiones)"
+            )
         }
         Mode::Single => "un solo flujo".to_owned(),
     };

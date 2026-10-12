@@ -30,6 +30,8 @@ const FLUSH_EVERY: usize = 16;
 const HASH_BLOCK: usize = 1 << 20;
 /// Periodo de muestreo para decidir cuántas conexiones usar.
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
+/// Ventana mínima de una muestra de velocidad.
+const MIN_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -65,8 +67,13 @@ impl Options {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Descarga segmentada por rangos, con reanudación.
-    Segmented { chunks: usize, connections: usize },
+    /// Descarga segmentada por rangos, con reanudación. `connections` es el pico alcanzado y
+    /// `settled` las conexiones con las que terminó (difieren si el controlador retrocedió).
+    Segmented {
+        chunks: usize,
+        connections: usize,
+        settled: usize,
+    },
     /// Un solo flujo, sin reanudación. Se usa cuando el servidor no atiende rangos.
     Single,
 }
@@ -249,7 +256,7 @@ async fn segmented(
         state_path: state_path.to_path_buf(),
         progress: opts.progress.clone(),
         max_attempts: opts.max_attempts.max(1),
-        done_bytes: AtomicU64::new(0),
+        rx_bytes: AtomicU64::new(0),
         limit: AtomicUsize::new(0),
     });
 
@@ -266,6 +273,8 @@ async fn segmented(
     let trace = std::env::var_os("W11DL_TRACE").is_some();
     let trace_start = Instant::now();
     let mut tick = tokio::time::interval(SAMPLE_EVERY);
+    // Si el bucle se retrasa, se pierde el tick en vez de recuperarlo en ráfaga con ventanas diminutas.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
     loop {
         tokio::select! {
@@ -284,7 +293,7 @@ async fn segmented(
                 }
             }
             _ = tick.tick(), if !controller.settled() => {
-                let Some(rate) = sampler.sample(shared.done_bytes.load(Ordering::Relaxed)) else {
+                let Some(rate) = sampler.sample(shared.rx_bytes.load(Ordering::Relaxed)) else {
                     continue;
                 };
                 let conns_before = controller.conns();
@@ -328,6 +337,7 @@ async fn segmented(
         mode: Mode::Segmented {
             chunks: chunk_count,
             connections: peak,
+            settled: controller.conns(),
         },
     }))
 }
@@ -348,8 +358,9 @@ struct Shared {
     state_path: PathBuf,
     progress: Option<Arc<AtomicU64>>,
     max_attempts: u32,
-    /// Bytes completados en esta ejecución; alimenta la medición del crecimiento adaptativo.
-    done_bytes: AtomicU64,
+    /// Bytes recibidos de la red (continuo, al llegar cada bloque). Alimenta la medición de velocidad
+    /// del controlador; no es el progreso confirmado, que cuenta fragmentos completados.
+    rx_bytes: AtomicU64,
     /// Número de trabajadores que deben seguir activos. Lo fija el controlador.
     limit: AtomicUsize,
 }
@@ -384,13 +395,20 @@ impl Sampler {
     }
 
     fn sample(&mut self, bytes: u64) -> Option<f64> {
-        if bytes == self.last_bytes {
+        self.sample_at(bytes, Instant::now())
+    }
+
+    /// Velocidad entre la muestra anterior y `now`. Ignora ventanas sin datos o demasiado cortas:
+    /// una ventana de milisegundos (ticks atrasados) daría una velocidad absurda que el controlador
+    /// tomaría como referencia. Si se ignora, la ventana sigue acumulando hasta la siguiente muestra.
+    fn sample_at(&mut self, bytes: u64, now: Instant) -> Option<f64> {
+        let elapsed = now.duration_since(self.last_at);
+        if bytes == self.last_bytes || elapsed < MIN_SAMPLE_WINDOW {
             return None;
         }
-        let elapsed = self.last_at.elapsed().as_secs_f64().max(f64::EPSILON);
-        let rate = (bytes - self.last_bytes) as f64 / elapsed;
+        let rate = (bytes - self.last_bytes) as f64 / elapsed.as_secs_f64();
         self.last_bytes = bytes;
-        self.last_at = Instant::now();
+        self.last_at = now;
         Some(rate)
     }
 }
@@ -417,7 +435,6 @@ async fn run_worker(shared: Arc<Shared>, id: usize) -> Result<()> {
         if let Some(p) = &shared.progress {
             p.fetch_add(chunk.len(), Ordering::Relaxed);
         }
-        shared.done_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
 
         shared.state.lock().await.done[chunk.index] = true;
         if shared.unflushed.fetch_add(1, Ordering::Relaxed) + 1 >= FLUSH_EVERY {
@@ -437,6 +454,7 @@ async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Bytes> {
             chunk,
             shared.etag.as_deref(),
             &shared.headers,
+            &shared.rx_bytes,
         )
         .await
         {
@@ -638,4 +656,39 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn el_muestreador_calcula_la_velocidad_de_la_ventana() {
+        let mut s = Sampler::new();
+        let t0 = s.last_at;
+        let rate = s
+            .sample_at(2_000_000, t0 + Duration::from_millis(250))
+            .unwrap();
+        assert!((rate - 8.0e6).abs() < 1.0, "{rate}");
+    }
+
+    #[test]
+    fn ventanas_diminutas_se_ignoran_y_se_acumulan() {
+        let mut s = Sampler::new();
+        let t0 = s.last_at;
+        // Ticks atrasados en ráfaga: 5 ms no deben dar una velocidad absurda.
+        assert_eq!(s.sample_at(1_000_000, t0 + Duration::from_millis(5)), None);
+        // La siguiente muestra suma todo lo acumulado desde la última válida.
+        let rate = s
+            .sample_at(2_000_000, t0 + Duration::from_millis(250))
+            .unwrap();
+        assert!((rate - 8.0e6).abs() < 1.0, "{rate}");
+    }
+
+    #[test]
+    fn sin_bytes_nuevos_no_hay_muestra() {
+        let mut s = Sampler::new();
+        let t0 = s.last_at;
+        assert_eq!(s.sample_at(0, t0 + Duration::from_millis(300)), None);
+    }
 }

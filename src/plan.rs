@@ -10,6 +10,10 @@ pub const RAMP_GAIN: f64 = 1.10;
 pub const DROP_BELOW: f64 = 0.90;
 /// Muestras sin mejora seguidas antes de quedarse en el mejor punto.
 pub const FLAT_SAMPLES_TO_STOP: u32 = 3;
+/// Muestras que se descartan tras añadir conexiones: las nuevas aún se están estableciendo.
+pub const POST_GROWTH_SKIP: u32 = 1;
+/// Caídas seguidas necesarias para retroceder. Una sola muestra baja puede ser ruido.
+pub const DROPS_TO_RETREAT: u32 = 2;
 
 /// Qué hacer tras una muestra de velocidad.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +37,10 @@ pub struct Controller {
     /// Mejor (conexiones, velocidad) observada hasta ahora.
     best: Option<(usize, f64)>,
     flat: u32,
+    /// Caídas seguidas por debajo de `DROP_BELOW` del mejor punto.
+    drops: u32,
+    /// Muestras pendientes de descartar tras el último crecimiento.
+    skip: u32,
     settled: bool,
     /// La primera muestra incluye el arranque de las conexiones: se descarta.
     warmed_up: bool,
@@ -46,6 +54,8 @@ impl Controller {
             conns: START_CONNECTIONS.min(max),
             best: None,
             flat: 0,
+            drops: 0,
+            skip: 0,
             settled: false,
             warmed_up: false,
         }
@@ -70,6 +80,10 @@ impl Controller {
             self.warmed_up = true;
             return Step::Hold;
         }
+        if self.skip > 0 {
+            self.skip -= 1;
+            return Step::Hold;
+        }
         let Some((best_conns, best_rate)) = self.best else {
             self.best = Some((self.conns, rate));
             return self.grow();
@@ -77,11 +91,18 @@ impl Controller {
         if rate >= best_rate * RAMP_GAIN {
             self.best = Some((self.conns, rate));
             self.flat = 0;
+            self.drops = 0;
             return self.grow();
         }
         if rate < best_rate * DROP_BELOW {
-            return self.settle_at(best_conns);
+            // Una caída aislada puede ser ruido: solo se retrocede si se confirma.
+            self.drops += 1;
+            if self.drops >= DROPS_TO_RETREAT {
+                return self.settle_at(best_conns);
+            }
+            return Step::Hold;
         }
+        self.drops = 0;
         self.flat += 1;
         if self.flat >= FLAT_SAMPLES_TO_STOP {
             return self.settle_at(best_conns);
@@ -95,6 +116,7 @@ impl Controller {
             return Step::Hold;
         }
         self.conns = (self.conns * 2).min(self.max);
+        self.skip = POST_GROWTH_SKIP;
         Step::Set(self.conns)
     }
 
@@ -264,6 +286,69 @@ mod tests {
         // Velocidad artificialmente baja al arrancar: no debe contar como referencia.
         assert_eq!(c.observe(1.0e6), Step::Hold);
         assert_eq!(c.observe(10.0e6), Step::Set(4));
+    }
+
+    #[test]
+    fn el_falso_retroceso_de_la_traza_lenta_ya_no_ocurre() {
+        // Secuencia real de la ejecución lenta: tras crecer a 8 conexiones, la primera muestra
+        // mostró 8,4 MB/s (las conexiones nuevas aún no aportaban). Antes provocaba `Set(4)`.
+        let mut c = Controller::new(8);
+        assert_eq!(c.observe(8.4e6), Step::Hold, "calentamiento");
+        assert_eq!(c.observe(8.4e6), Step::Set(4), "crece a 4");
+        assert_eq!(
+            c.observe(16.8e6),
+            Step::Hold,
+            "se descarta la muestra tras crecer"
+        );
+        assert_eq!(c.observe(16.8e6), Step::Set(8), "crece a 8");
+        assert_eq!(
+            c.observe(8.4e6),
+            Step::Hold,
+            "muestra artefacto tras crecer: se descarta"
+        );
+        assert_eq!(
+            c.observe(33.0e6),
+            Step::Hold,
+            "ya con las 8 conexiones aportando"
+        );
+        assert!(c.conns() == 8, "no debe haber retrocedido: {}", c.conns());
+    }
+
+    #[test]
+    fn una_sola_caida_no_basta_para_retroceder() {
+        let mut c = Controller::new(8);
+        c.observe(10.0e6); // calentamiento
+        assert_eq!(c.observe(10.0e6), Step::Set(4));
+        c.observe(20.0e6); // descartada tras crecer
+        assert_eq!(c.observe(20.0e6), Step::Set(8));
+        c.observe(5.0e6); // descartada tras crecer
+        assert_eq!(
+            c.observe(12.0e6),
+            Step::Hold,
+            "primera caída real: se espera confirmación"
+        );
+        assert_eq!(
+            c.observe(40.0e6),
+            Step::Hold,
+            "se recupera: la caída no se confirmó"
+        );
+        assert_eq!(c.conns(), 8);
+    }
+
+    #[test]
+    fn dos_caidas_seguidas_si_hacen_retroceder() {
+        let mut c = Controller::new(8);
+        c.observe(10.0e6);
+        assert_eq!(c.observe(10.0e6), Step::Set(4));
+        c.observe(20.0e6);
+        assert_eq!(c.observe(20.0e6), Step::Set(8));
+        c.observe(5.0e6);
+        assert_eq!(c.observe(12.0e6), Step::Hold);
+        assert_eq!(
+            c.observe(12.0e6),
+            Step::Set(4),
+            "caída confirmada: vuelve al mejor punto"
+        );
     }
 
     #[test]
