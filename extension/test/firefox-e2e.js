@@ -81,9 +81,15 @@ async function scenario({ name, hostWorks }) {
   );
 
   const server = http.createServer((req, res) => {
+    if (req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<a href="/${FILE}">uno</a><a href="/otro.zip">dos</a>`);
+      return;
+    }
+    const name = path.basename(req.url.split("?")[0]);
     res.writeHead(200, {
       "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${FILE}"`,
+      "Content-Disposition": `attachment; filename="${name}"`,
       "Content-Length": PAYLOAD.length,
     });
     res.end(PAYLOAD);
@@ -127,6 +133,7 @@ async function scenario({ name, hostWorks }) {
 
     const tree = await client.call("browsingContext.getTree", {});
     const context = tree.contexts[0].context;
+
     // En el escenario de captura la navegación se aborta a propósito: la extensión la cancela.
     await client
       .call("browsingContext.navigate", { context, url: `http://127.0.0.1:${port}/${FILE}`, wait: "none" })
