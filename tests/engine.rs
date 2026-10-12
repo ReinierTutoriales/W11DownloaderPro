@@ -320,3 +320,39 @@ async fn estado_corrupto_se_descarta_sin_fallar() {
     assert_eq!(std::fs::read(&out).unwrap(), data);
     assert_eq!(report.resumed, 0);
 }
+
+#[tokio::test]
+async fn estado_de_otro_plan_se_descarta_y_no_corrompe_el_archivo() {
+    let data = payload(2 * 1024 * 1024);
+    let (addr, _server) = start(data.clone(), true, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("viejo.bin");
+    let url = format!("http://{addr}/file");
+
+    // Estado "de una versión anterior": mismo recurso y tamaño de fragmento, pero un vector `done`
+    // de otra longitud, con todo marcado como completo. El parcial está lleno de ceros.
+    let opts = options(url.clone(), out.clone());
+    let chunk_size =
+        plan::effective_chunk_size(data.len() as u64, opts.connections, opts.max_chunk);
+    let right_len = plan::plan(data.len() as u64, chunk_size).len();
+    let mut stale = State::new(&url, data.len() as u64, chunk_size, Some(ETAG_VALUE.into()));
+    stale.done = vec![true; right_len + 5];
+    std::fs::write(dir.path().join("viejo.bin.part"), vec![0u8; data.len()]).unwrap();
+    std::fs::write(
+        dir.path().join("viejo.bin.part.state"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(
+        report.resumed, 0,
+        "no debe fiarse de un estado con otro plan"
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "el archivo publicado debe ser el correcto"
+    );
+}

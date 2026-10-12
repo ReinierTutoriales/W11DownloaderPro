@@ -221,7 +221,12 @@ async fn segmented(
 
     let resumable = load_state(state_path)
         .await
-        .filter(|s| s.matches(&url, total, remote.etag.as_deref()) && s.chunk_size == chunk_size)
+        .filter(|s| {
+            s.matches(&url, total, remote.etag.as_deref())
+                && s.chunk_size == chunk_size
+                // Un estado hecho con otro plan de fragmentos tendría índices que no corresponden.
+                && s.done.len() == plan::plan(total, chunk_size).len()
+        })
         .filter(|_| part.exists());
 
     let fresh = resumable.is_none();

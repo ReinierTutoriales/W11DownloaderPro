@@ -179,24 +179,54 @@ pub fn effective_chunk_size(total: u64, connections: usize, max_chunk: u64) -> u
     per_connection.clamp(MIN_CHUNK, max_chunk.max(MIN_CHUNK))
 }
 
-/// Divide `[0, total)` en fragmentos de `chunk_size`, el último puede ser más corto.
+/// Los últimos fragmentos se parten en trozos de `chunk_size / TAPER_DIVISOR`.
+const TAPER_DIVISOR: u64 = 4;
+/// La cola afilada abarca los últimos `TAPER_TAIL_CHUNKS` fragmentos.
+const TAPER_TAIL_CHUNKS: u64 = 4;
+/// Solo se afila la cola si el archivo tiene al menos tantos fragmentos como esto.
+const TAPER_MIN_CHUNKS: u64 = 8;
+
+/// Divide `[0, total)` en fragmentos de `chunk_size`, con la cola partida en trozos menores.
+///
+/// Con fragmentos uniformes, al final unas conexiones esperan un fragmento entero (a la velocidad
+/// de *una* conexión) mientras las demás están ociosas. Partir los últimos fragmentos reduce esa
+/// espera. El plan es una función de `(total, chunk_size)`: el estado de reanudación depende de que
+/// no cambie entre ejecuciones.
 pub fn plan(total: u64, chunk_size: u64) -> Vec<Chunk> {
     if total == 0 {
         return Vec::new();
     }
     let chunk_size = chunk_size.max(1);
-    let count = total.div_ceil(chunk_size);
-    (0..count)
-        .map(|i| {
-            let start = i * chunk_size;
-            let end = (start + chunk_size).min(total) - 1;
-            Chunk {
-                index: i as usize,
-                start,
-                end,
-            }
-        })
-        .collect()
+    let small = chunk_size / TAPER_DIVISOR;
+    let taper = small >= MIN_CHUNK && total >= chunk_size * TAPER_MIN_CHUNKS;
+    let tail = if taper {
+        (chunk_size * TAPER_TAIL_CHUNKS).min(total / 4)
+    } else {
+        0
+    };
+    let body_end = total - tail;
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < body_end {
+        let end = (start + chunk_size).min(body_end) - 1;
+        chunks.push(Chunk {
+            index: chunks.len(),
+            start,
+            end,
+        });
+        start = end + 1;
+    }
+    while start < total {
+        let end = (start + small).min(total) - 1;
+        chunks.push(Chunk {
+            index: chunks.len(),
+            start,
+            end,
+        });
+        start = end + 1;
+    }
+    chunks
 }
 
 /// Estado persistido junto al archivo parcial. Permite reanudar sin volver a bajar lo completado.
@@ -410,6 +440,59 @@ mod tests {
         let mut c = Controller::new(8);
         assert_eq!(c.observe(0.0), Step::Hold);
         assert_eq!(c.conns(), START_CONNECTIONS);
+    }
+
+    #[test]
+    fn la_cola_se_parte_en_trozos_menores() {
+        let chunk = 2 * 1024 * 1024;
+        let chunks = plan(64 * 1024 * 1024, chunk);
+        let sizes: Vec<u64> = chunks.iter().map(Chunk::len).collect();
+        assert_eq!(
+            *sizes.first().unwrap(),
+            chunk,
+            "el cuerpo usa el tamaño normal"
+        );
+        assert_eq!(
+            *sizes.last().unwrap(),
+            chunk / 4,
+            "la cola usa trozos menores"
+        );
+        assert!(
+            chunks.len() > 32,
+            "más fragmentos que el plan uniforme: {}",
+            chunks.len()
+        );
+        // Los menores solo aparecen al final: nunca hay uno grande después de uno pequeño.
+        let first_small = sizes.iter().position(|s| *s < chunk).unwrap();
+        assert!(sizes[first_small..].iter().all(|s| *s <= chunk / 4));
+    }
+
+    #[test]
+    fn el_plan_afilado_sigue_cubriendo_todo_sin_huecos() {
+        for total in [3_000_000u64, 17_777_777, 64 * 1024 * 1024 + 123] {
+            let chunks = plan(total, 1024 * 1024);
+            let mut next = 0;
+            for (i, c) in chunks.iter().enumerate() {
+                assert_eq!(c.index, i);
+                assert_eq!(c.start, next, "hueco o solape en {total}");
+                next = c.end + 1;
+            }
+            assert_eq!(next, total);
+        }
+    }
+
+    #[test]
+    fn archivos_pequenos_o_con_fragmentos_minimos_no_se_afilan() {
+        // Pocos fragmentos: no hay cola que afilar.
+        assert_eq!(plan(3 * 1024 * 1024, 1024 * 1024).len(), 3);
+        // Fragmento demasiado pequeño para dividirlo sin bajar de MIN_CHUNK.
+        let chunks = plan(10_000_000, MIN_CHUNK);
+        assert!(
+            chunks
+                .iter()
+                .take(chunks.len() - 1)
+                .all(|c| c.len() == MIN_CHUNK)
+        );
     }
 
     #[test]
