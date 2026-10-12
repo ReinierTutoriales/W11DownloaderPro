@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use crate::error::{Error, Result};
 use crate::net::{self, HttpClient, Remote};
 use crate::plan::{self, Chunk, State};
+use crate::proxy::ProxyMode;
 
 pub const DEFAULT_CONNECTIONS: usize = 8;
 pub const DEFAULT_MAX_CHUNK: u64 = 4 << 20;
@@ -35,6 +36,7 @@ pub struct Options {
     pub max_attempts: u32,
     /// SHA-256 esperado en hexadecimal minúsculas. Si se indica, el archivo solo se publica si coincide.
     pub sha256: Option<String>,
+    pub proxy: ProxyMode,
     /// Bytes completados, actualizado en tiempo real por las tareas de descarga.
     pub progress: Option<Arc<AtomicU64>>,
 }
@@ -48,6 +50,7 @@ impl Options {
             max_chunk: DEFAULT_MAX_CHUNK,
             max_attempts: DEFAULT_ATTEMPTS,
             sha256: None,
+            proxy: ProxyMode::System,
             progress: None,
         }
     }
@@ -73,7 +76,7 @@ pub struct Report {
 
 pub async fn download(opts: Options) -> Result<Report> {
     let started = Instant::now();
-    let client = net::build_client(opts.connections)?;
+    let client = net::build_client(opts.connections, &opts.proxy)?;
     let remote = net::probe(&client, &opts.url).await?;
     let part = with_suffix(&opts.output, ".part");
     let state_path = with_suffix(&opts.output, ".part.state");

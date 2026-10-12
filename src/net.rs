@@ -9,13 +9,13 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
 use crate::error::{Error, Result};
 use crate::plan::Chunk;
+use crate::proxy::{ProxyConnector, ProxyMode};
 
-pub type HttpClient = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+pub type HttpClient = Client<HttpsConnector<ProxyConnector>, Empty<Bytes>>;
 
 const MAX_REDIRECTS: usize = 10;
 const USER_AGENT_VALUE: &str = concat!("w11dl/", env!("CARGO_PKG_VERSION"));
@@ -34,12 +34,13 @@ pub struct Remote {
 }
 
 /// Crea el cliente. Los certificados vienen del almacén del sistema, que en Windows es el oficial.
-pub fn build_client(max_idle_per_host: usize) -> Result<HttpClient> {
+pub fn build_client(max_idle_per_host: usize, proxy: &ProxyMode) -> Result<HttpClient> {
+    let connector = ProxyConnector::new(proxy);
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()?
         .https_or_http()
         .enable_all_versions()
-        .build();
+        .wrap_connector(connector);
 
     Ok(Client::builder(TokioExecutor::new())
         .pool_max_idle_per_host(max_idle_per_host)
@@ -241,4 +242,49 @@ mod tests {
         assert!(parse_url("file:///etc/passwd").is_err());
         assert!(parse_url("https://x.test/a").is_ok());
     }
+}
+
+/// Cuerpo pequeño de una respuesta, con su tipo de contenido.
+#[derive(Debug, Clone)]
+pub struct Body {
+    pub content_type: Option<String>,
+    pub bytes: Bytes,
+}
+
+/// Descarga un recurso pequeño entero (páginas HTML, `robots.txt`).
+/// Devuelve `None` si no existe (404/410) o si supera `limit` bytes.
+pub async fn get_small(client: &HttpClient, url: &Uri, limit: usize) -> Result<Option<Body>> {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(ACCEPT_ENCODING, "identity")
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+
+    let resp = client.request(req).await?;
+    let status = resp.status();
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(Error::Status(status.as_u16()));
+    }
+
+    let content_type = header_string(resp.headers(), hyper::header::CONTENT_TYPE);
+    let mut body = resp.into_body();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Ok(data) = frame.into_data() {
+            if buf.len() + data.len() > limit {
+                return Ok(None);
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(Some(Body {
+        content_type,
+        bytes: buf.freeze(),
+    }))
 }
