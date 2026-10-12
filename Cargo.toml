@@ -1,0 +1,32 @@
+[package]
+name = "w11dl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+description = "Motor de descargas acelerado para Windows 11"
+publish = false
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "time"] }
+hyper = { version = "1.12", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27.10", features = ["http2", "native-tokio"] }
+http-body-util = "0.1.5"
+bytes = "1"
+rustls = "0.23.45"
+sha2 = "0.11.0"
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+hyper = { version = "1.12", features = ["server"] }
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
