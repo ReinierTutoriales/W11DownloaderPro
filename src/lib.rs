@@ -15,6 +15,7 @@ pub mod register;
 pub mod runtime;
 pub mod schedule;
 pub mod video;
+pub mod ytdlp;
 
 pub use engine::{Mode, Options, Report, download};
 pub use error::{Error, Result};

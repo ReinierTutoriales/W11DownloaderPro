@@ -50,6 +50,10 @@ pub struct Record {
     #[serde(flatten)]
     pub state: State,
     pub bytes: u64,
+    /// La descarga la hace yt-dlp desde la página (HLS, DASH…): `url` es la página, no un archivo.
+    /// Se persiste para poder retomarla tras reiniciar, porque yt-dlp vuelve a resolver el enlace.
+    #[serde(default)]
+    pub via_ytdlp: bool,
 }
 
 /// Entrada en memoria: el registro, el control activo y las cabeceras de sesión (solo en memoria).
@@ -144,6 +148,7 @@ mod tests {
             path: PathBuf::from(id),
             state,
             bytes: 7,
+            via_ytdlp: false,
         }
     }
 

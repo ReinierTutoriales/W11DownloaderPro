@@ -1,3 +1,4 @@
+#![allow(dead_code)] // cada prueba usa solo parte de estos ayudantes
 //! Servidor HTTP estático para pruebas: rutas fijas, rangos, `ETag` y contador de peticiones.
 
 use std::collections::HashMap;

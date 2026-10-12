@@ -110,6 +110,7 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     let mut headers = Vec::new();
     let mut default_output = default_name(&cli.url);
     let mut merge: Option<w11dl::merge::MergeJob> = None;
+    let mut delegated: Option<w11dl::ytdlp::YtDlpJob> = None;
     if cli.video {
         let opts = video::ProbeOptions {
             python: cli.python.clone().or_else(video::default_python),
@@ -132,6 +133,30 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                 .map_or("resolución desconocida".into(), |h| format!("{h}p"))
         );
         default_output = PathBuf::from(&choice.filename);
+        if choice.via_ytdlp {
+            let out_dir = cli
+                .output
+                .as_ref()
+                .and_then(|o| o.parent())
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let stem = cli
+                .output
+                .as_ref()
+                .unwrap_or(&PathBuf::from(&choice.filename))
+                .file_stem()
+                .map_or_else(|| "video".into(), |s| s.to_string_lossy().into_owned());
+            delegated = Some(w11dl::ytdlp::YtDlpJob {
+                python: opts.python.clone().ok_or("falta el entorno de yt-dlp")?,
+                ffmpeg: ffmpeg.clone(),
+                page: cli.url.clone(),
+                temp_dir: w11dl::ytdlp::temp_dir_for(&out_dir, "cli"),
+                out_dir,
+                stem,
+                rate_limit: cli.limit.unwrap_or(0),
+                cookies: cli.cookies.clone(),
+            });
+        }
         if let (Some(audio), Some(ffmpeg)) = (choice.audio, ffmpeg) {
             merge = Some(w11dl::merge::MergeJob {
                 video: w11dl::merge::Track {
@@ -147,6 +172,32 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         }
         url = choice.url;
         headers = choice.headers;
+    }
+    if let Some(job) = delegated {
+        let progress = Arc::new(AtomicU64::new(0));
+        let reporter = spawn_reporter(Arc::clone(&progress));
+        let result =
+            w11dl::ytdlp::download(&job, w11dl::engine::Control::default(), Some(progress)).await;
+        reporter.abort();
+        eprintln!();
+        return match result {
+            Ok((w11dl::engine::Outcome::Completed(report), Some(path))) => {
+                println!(
+                    "Listo: {} ({} bytes, vía yt-dlp)",
+                    path.display(),
+                    report.bytes
+                );
+                Ok(true)
+            }
+            Ok(_) => {
+                eprintln!("Error: descarga interrumpida");
+                Ok(false)
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                Ok(false)
+            }
+        };
     }
     let output = cli.output.unwrap_or(default_output);
     let progress = Arc::new(AtomicU64::new(0));

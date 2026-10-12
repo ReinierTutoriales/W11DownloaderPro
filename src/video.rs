@@ -24,6 +24,7 @@ const DIRECT_VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "mov"];
 #[derive(Debug, Deserialize)]
 struct Info {
     title: Option<String>,
+    is_live: Option<bool>,
     #[serde(flatten)]
     single: Format,
     formats: Option<Vec<Format>>,
@@ -59,6 +60,9 @@ pub struct Choice {
     pub headers: Vec<(String, String)>,
     /// Si existe, `url` es solo imagen y el sonido va aparte: hay que unirlos con ffmpeg.
     pub audio: Option<AudioPart>,
+    /// El motor no puede bajarlo directamente (HLS, DASH…): `url` es la página y la descarga la hace
+    /// yt-dlp, que sabe resolver y unir los fragmentos de todos sus sitios compatibles.
+    pub via_ytdlp: bool,
 }
 
 /// Opciones de la consulta a yt-dlp.
@@ -123,12 +127,17 @@ pub async fn probe(page: &str, opts: &ProbeOptions) -> Result<Choice> {
     }
 
     let info: Info = serde_json::from_slice(&output.stdout)?;
-    select(info, opts.ffmpeg.is_some())
+    select(info, opts.ffmpeg.is_some(), page)
 }
 
 /// Elige el formato directo. Separado de `probe` para poder probarlo sin ejecutar yt-dlp.
 /// `can_merge` indica si hay ffmpeg para unir imagen y sonido de formatos separados.
-fn select(info: Info, can_merge: bool) -> Result<Choice> {
+fn select(info: Info, can_merge: bool, page: &str) -> Result<Choice> {
+    if info.is_live == Some(true) {
+        return Err(Error::Video(
+            "las emisiones en directo no se pueden descargar".into(),
+        ));
+    }
     let mut candidates: Vec<Format> = info.formats.unwrap_or_default();
     // Un archivo directo puede venir sin lista de formatos: el propio objeto es el formato.
     if candidates.is_empty() && info.single.url.is_some() {
@@ -153,10 +162,47 @@ fn select(info: Info, can_merge: bool) -> Result<Choice> {
     // La pareja separada gana solo si da más resolución que el mejor formato completo.
     let merged = match (combined, &pair) {
         (Some(c), Some((v, _, _))) => can_merge && v.height.unwrap_or(0) > c.height.unwrap_or(0),
-        (None, Some(_)) => true,
+        (None, Some(_)) => can_merge,
         _ => false,
     };
-    if merged && !can_merge {
+    let own_height = if merged {
+        pair.as_ref().and_then(|(v, _, _)| v.height)
+    } else {
+        combined.and_then(|c| c.height)
+    }
+    .unwrap_or(0);
+    let has_own = merged || combined.is_some();
+
+    // Lo que el motor no baja directamente (HLS, DASH, otros contenedores) lo cubre yt-dlp, sin DRM.
+    let delegable_height = candidates
+        .iter()
+        .filter(|f| {
+            !is_direct_video(f) && f.vcodec.as_deref() != Some("none") && f.has_drm != Some(true)
+        })
+        .filter(|f| f.url.is_some() || f.protocol.is_some())
+        .map(|f| f.height.unwrap_or(0))
+        .max();
+    if let Some(height) = delegable_height {
+        // Sin ffmpeg, yt-dlp deja el HLS en un contenedor mal formado: no se delega sin él.
+        if !has_own && !can_merge {
+            return Err(Error::Video(format!(
+                "este vídeo se entrega por fragmentos (HLS/DASH) y necesita ffmpeg. \
+                 Instálalo desde {FFMPEG_DOWNLOAD_URL} (o indica su ruta en W11DL_FFMPEG) y vuelve a intentarlo"
+            )));
+        }
+        if can_merge && (!has_own || height > own_height) {
+            return Ok(Choice {
+                url: page.to_owned(),
+                filename: format!("{stem}.mp4"),
+                height: (height > 0).then_some(height),
+                headers: Vec::new(),
+                audio: None,
+                via_ytdlp: true,
+            });
+        }
+    }
+
+    if pair.is_some() && !has_own {
         return Err(Error::Video(format!(
             "este vídeo entrega imagen y sonido por separado y necesita ffmpeg para unirlos. \
              Instálalo desde {FFMPEG_DOWNLOAD_URL} (o indica su ruta en W11DL_FFMPEG) y vuelve a intentarlo"
@@ -173,10 +219,17 @@ fn select(info: Info, can_merge: bool) -> Result<Choice> {
                 url: audio.url.clone().unwrap_or_default(),
                 headers: clean_headers(audio),
             }),
+            via_ytdlp: false,
         });
     }
-    let best = combined
-        .ok_or_else(|| Error::Video("no hay un formato de vídeo directo sin DRM".into()))?;
+    let best = combined.ok_or_else(|| {
+        let protected = candidates.iter().any(|f| f.has_drm == Some(true));
+        Error::Video(if protected {
+            "el vídeo está protegido con DRM y no se puede descargar".into()
+        } else {
+            "no hay un formato de vídeo descargable".into()
+        })
+    })?;
     Ok(Choice {
         url: best.url.clone().unwrap_or_default(),
         filename: format!(
@@ -186,6 +239,7 @@ fn select(info: Info, can_merge: bool) -> Result<Choice> {
         height: best.height,
         headers: clean_headers(best),
         audio: None,
+        via_ytdlp: false,
     })
 }
 
@@ -302,10 +356,21 @@ pub async fn find_ffmpeg() -> Option<PathBuf> {
             .await
             .is_ok_and(|status| status.success());
         if ok {
-            return Some(candidate);
+            // yt-dlp necesita la ruta real: un nombre suelto no lo encuentra y no avisa.
+            return Some(resolve_in_path(&candidate).unwrap_or(candidate));
         }
     }
     None
+}
+
+/// Ruta completa de un ejecutable que se dio solo por nombre, buscándolo en el PATH.
+fn resolve_in_path(candidate: &std::path::Path) -> Option<PathBuf> {
+    if candidate.components().count() != 1 {
+        return Some(candidate.to_path_buf());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(candidate))
+        .find(|p| p.is_file())
 }
 
 /// Cabeceras que el motor gestiona por su cuenta y no deben copiarse de yt-dlp.
@@ -328,13 +393,15 @@ pub fn default_python() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    const PAGE: &str = "https://sitio.test/ver";
+
     fn info(json: &str) -> Info {
         serde_json::from_str(json).unwrap()
     }
 
     /// Sin ffmpeg: solo formatos completos.
     fn select_solo(info: Info) -> Result<Choice> {
-        select(info, false)
+        select(info, false, PAGE)
     }
 
     const YOUTUBE_LIKE: &str = r#"{"title":"Zoo","formats":[
@@ -349,7 +416,7 @@ mod tests {
 
     #[test]
     fn con_ffmpeg_une_la_mejor_imagen_con_el_mejor_sonido_compatible() {
-        let c = select(info(YOUTUBE_LIKE), true).unwrap();
+        let c = select(info(YOUTUBE_LIKE), true, PAGE).unwrap();
         assert_eq!(
             c.url, "https://x.test/v1080.mp4",
             "mp4 gana a webm a igual resolución; el DRM se ignora"
@@ -365,14 +432,14 @@ mod tests {
 
     #[test]
     fn sin_ffmpeg_prefiere_el_completo_y_sin_completo_explica_la_dependencia() {
-        let c = select(info(YOUTUBE_LIKE), false).unwrap();
+        let c = select(info(YOUTUBE_LIKE), false, PAGE).unwrap();
         assert_eq!(c.url, "https://x.test/18.mp4");
         assert!(c.audio.is_none());
 
         let solo_separados = r#"{"title":"x","formats":[
             {"url":"https://x.test/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"none","height":720},
             {"url":"https://x.test/a.m4a","ext":"m4a","protocol":"https","vcodec":"none","acodec":"mp4a","abr":128}]}"#;
-        let Err(Error::Video(m)) = select(info(solo_separados), false) else {
+        let Err(Error::Video(m)) = select(info(solo_separados), false, PAGE) else {
             panic!("debía pedir ffmpeg");
         };
         assert!(
@@ -387,7 +454,7 @@ mod tests {
             {"url":"https://x.test/c.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","height":720},
             {"url":"https://x.test/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"none","height":720},
             {"url":"https://x.test/a.m4a","ext":"m4a","protocol":"https","vcodec":"none","acodec":"mp4a","abr":128}]}"#;
-        let c = select(info(json), true).unwrap();
+        let c = select(info(json), true, PAGE).unwrap();
         assert_eq!(c.url, "https://x.test/c.mp4");
         assert!(c.audio.is_none());
     }
@@ -397,7 +464,7 @@ mod tests {
         let json = r#"{"title":"x","formats":[
             {"url":"https://x.test/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"none","height":720},
             {"url":"https://x.test/a.webm","ext":"webm","protocol":"https","vcodec":"none","acodec":"opus","abr":128}]}"#;
-        let c = select(info(json), true).unwrap();
+        let c = select(info(json), true, PAGE).unwrap();
         assert_eq!(c.filename, "x.mkv", "opus no cabe en mp4 sin recodificar");
         assert!(c.audio.is_some());
     }
@@ -421,16 +488,77 @@ mod tests {
     }
 
     #[test]
-    fn descarta_drm_y_streams_segmentados() {
-        let r = select_solo(info(
+    fn hls_sin_drm_lo_cubre_ytdlp_y_el_drm_se_descarta() {
+        let c = select(info(
             r#"{
             "title": "x",
             "formats": [
                 {"url":"https://x.test/d.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","height":1080,"has_drm":true},
-                {"url":"https://x.test/p.m3u8","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","height":1080}
+                {"url":"https://x.test/p.m3u8","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","height":720}
             ]}"#,
-        ));
-        assert!(matches!(r, Err(Error::Video(_))), "{r:?}");
+        ), true, PAGE)
+        .unwrap();
+        assert!(c.via_ytdlp, "{c:?}");
+        assert_eq!(
+            c.url, PAGE,
+            "yt-dlp descarga desde la página, no desde el fragmento"
+        );
+        assert_eq!(c.height, Some(720));
+    }
+
+    #[test]
+    fn hls_sin_ffmpeg_explica_la_dependencia() {
+        let Err(Error::Video(m)) = select_solo(info(
+            r#"{"title":"x","formats":[
+                {"url":"https://x.test/h.m3u8","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","height":720}]}"#,
+        )) else {
+            panic!("debía pedir ffmpeg");
+        };
+        assert!(m.contains("ffmpeg") && m.contains("HLS"), "{m}");
+    }
+
+    #[test]
+    fn solo_drm_da_un_mensaje_claro() {
+        let Err(Error::Video(m)) = select_solo(info(
+            r#"{"title":"x","formats":[
+                {"url":"https://x.test/d.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","height":1080,"has_drm":true},
+                {"url":"https://x.test/d.m3u8","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","height":1080,"has_drm":true}]}"#,
+        )) else {
+            panic!("debía fallar");
+        };
+        assert!(m.contains("DRM"), "{m}");
+    }
+
+    #[test]
+    fn el_directo_gana_salvo_que_yt_dlp_dé_más_resolución() {
+        let json = |hls_height: u32| {
+            format!(
+                r#"{{"title":"x","formats":[
+                {{"url":"https://x.test/c.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","height":720}},
+                {{"url":"https://x.test/h.m3u8","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","height":{hls_height}}}]}}"#
+            )
+        };
+        let same = select(info(&json(720)), true, PAGE).unwrap();
+        assert!(
+            !same.via_ytdlp && same.url == "https://x.test/c.mp4",
+            "a igual calidad, el motor propio"
+        );
+        let better = select(info(&json(1080)), true, PAGE).unwrap();
+        assert!(better.via_ytdlp, "con más resolución en HLS, yt-dlp");
+        // Sin ffmpeg no se delega el HLS: se queda con el directo de menor resolución.
+        let sin = select_solo(info(&json(1080))).unwrap();
+        assert!(!sin.via_ytdlp && sin.url == "https://x.test/c.mp4");
+    }
+
+    #[test]
+    fn las_emisiones_en_directo_se_rechazan() {
+        let Err(Error::Video(m)) = select_solo(info(
+            r#"{"title":"x","is_live":true,"formats":[
+                {"url":"https://x.test/l.m3u8","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","height":720}]}"#,
+        )) else {
+            panic!("debía fallar");
+        };
+        assert!(m.contains("directo"), "{m}");
     }
 
     #[test]

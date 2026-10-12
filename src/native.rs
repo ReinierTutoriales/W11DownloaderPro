@@ -210,6 +210,7 @@ where
                             path: job.output.clone(),
                             state: State::Running,
                             bytes: 0,
+                            via_ytdlp: false,
                         },
                         job.headers.clone(),
                     );
@@ -251,6 +252,11 @@ where
                 Some(entry) if entry.record.state == State::Running => entry.control.cancel(),
                 Some(entry) if entry.record.state.is_resumable() => {
                     remove_partials(&entry.record.path).await;
+                    if entry.record.via_ytdlp {
+                        let dir = entry.record.path.parent().unwrap_or(&out_dir);
+                        let _ =
+                            tokio::fs::remove_dir_all(crate::ytdlp::temp_dir_for(dir, &id)).await;
+                    }
                     registry.update(&id, |e| e.record.state = State::Canceled);
                     let _ = registry.save(&out_dir);
                     let _ = tx.send(Outgoing::Canceled { id });
@@ -277,6 +283,7 @@ where
                         headers: entry.headers.clone(),
                         control,
                         merge: entry.merge.clone(),
+                        ytdlp: entry.record.via_ytdlp,
                     };
                     let _ = tx.send(Outgoing::Accepted {
                         id: id.clone(),
@@ -339,6 +346,8 @@ struct Job {
     control: Control,
     /// Imagen y sonido por separado: se descargan ambos y se unen con ffmpeg.
     merge: Option<crate::merge::MergeJob>,
+    /// La descarga la hace yt-dlp desde la página (`url`).
+    ytdlp: bool,
 }
 
 /// Valida la petición antes de aceptarla: URL web, cabeceras permitidas y nombre seguro.
@@ -377,6 +386,7 @@ fn prepare(
         headers: map,
         control: Control::default(),
         merge: None,
+        ytdlp: false,
     })
 }
 
@@ -409,7 +419,11 @@ async fn run_video(
             return;
         }
     };
-    let output = naming::unique_path(&out_dir, &choice.filename);
+    let output = if choice.via_ytdlp {
+        unique_media_path(&out_dir, &choice.filename)
+    } else {
+        naming::unique_path(&out_dir, &choice.filename)
+    };
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         let _ = tx.send(Outgoing::Error {
             id,
@@ -437,6 +451,7 @@ async fn run_video(
             path: output.clone(),
             state: State::Running,
             bytes: 0,
+            via_ytdlp: choice.via_ytdlp,
         },
         headers.clone(),
     );
@@ -474,6 +489,7 @@ async fn run_video(
         headers,
         control,
         merge,
+        ytdlp: choice.via_ytdlp,
     };
     run(job, tx, registry, out_dir, limiter).await;
 }
@@ -503,6 +519,11 @@ async fn run(
             }
         })
     };
+
+    if job.ytdlp {
+        run_ytdlp(job, progress, reporter, tx, registry, out_dir, limiter).await;
+        return;
+    }
 
     let mut opts = Options::new(job.url, job.output.clone());
     opts.headers = job.headers;
@@ -591,6 +612,7 @@ pub async fn run_pending(out_dir: PathBuf) -> crate::schedule::Summary {
             headers: HeaderMap::new(),
             control,
             merge: None,
+            ytdlp: record.via_ytdlp,
         };
         let (slots, tx, registry, out_dir, limiter) = (
             Arc::clone(&slots),
@@ -641,6 +663,117 @@ mod settings {
         )?;
         std::fs::rename(&tmp, dir.join(FILE))
     }
+}
+
+/// Descarga delegada en yt-dlp (HLS, DASH…): el resultado se guarda igual que el de cualquier otra,
+/// pero la ruta final la decide yt-dlp según el contenedor.
+async fn run_ytdlp(
+    job: Job,
+    progress: Arc<AtomicU64>,
+    reporter: tokio::task::JoinHandle<()>,
+    tx: mpsc::UnboundedSender<Outgoing>,
+    registry: Registry,
+    out_dir: PathBuf,
+    limiter: Arc<RateLimiter>,
+) {
+    let result = match crate::video::default_python() {
+        None => Err(crate::error::Error::Video(
+            "falta el entorno de yt-dlp: ejecuta w11dl-host setup".into(),
+        )),
+        Some(python) => {
+            let dir = job.output.parent().unwrap_or(&out_dir).to_path_buf();
+            let ytdlp_job = crate::ytdlp::YtDlpJob {
+                python,
+                ffmpeg: crate::video::find_ffmpeg().await,
+                page: job.url.clone(),
+                temp_dir: crate::ytdlp::temp_dir_for(&dir, &job.id),
+                stem: job
+                    .output
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "video".into()),
+                out_dir: dir,
+                rate_limit: limiter.rate(),
+                cookies: None,
+            };
+            crate::ytdlp::download(&ytdlp_job, job.control.clone(), Some(progress)).await
+        }
+    };
+    reporter.abort();
+
+    let message = match result {
+        Ok((Outcome::Completed(report), Some(path))) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Done;
+                e.record.bytes = report.bytes;
+                e.record.path = path.clone();
+            });
+            Outgoing::Done {
+                id: job.id.clone(),
+                path: path.display().to_string(),
+                bytes: report.bytes,
+            }
+        }
+        Ok((Outcome::Paused { bytes }, _)) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Paused;
+                e.record.bytes = bytes;
+            });
+            Outgoing::Paused {
+                id: job.id.clone(),
+                bytes,
+            }
+        }
+        Ok((Outcome::Canceled, _)) => {
+            registry.update(&job.id, |e| e.record.state = State::Canceled);
+            Outgoing::Canceled { id: job.id.clone() }
+        }
+        Ok((Outcome::Completed(_), None)) => {
+            failed(&registry, &job.id, "yt-dlp no indicó el archivo final")
+        }
+        Err(e) => failed(&registry, &job.id, &e.to_string()),
+    };
+    if let Err(e) = registry.save(&out_dir) {
+        eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
+    }
+    let _ = tx.send(message);
+}
+
+fn failed(registry: &Registry, id: &str, message: &str) -> Outgoing {
+    registry.update(id, |en| {
+        en.record.state = State::Failed {
+            message: message.to_owned(),
+        }
+    });
+    Outgoing::Error {
+        id: id.to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+/// Ruta libre para un vídeo cuyo contenedor decide yt-dlp: ninguna de las extensiones posibles
+/// puede existir ya con ese nombre, o se tomaría un archivo ajeno por el recién descargado.
+fn unique_media_path(dir: &Path, filename: &str) -> PathBuf {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video".into());
+    let ext = path
+        .extension()
+        .map_or("mp4".into(), |e| e.to_string_lossy().into_owned());
+    let taken = |name: &str| {
+        ["mp4", "mkv", "webm", "mov"]
+            .iter()
+            .any(|e| dir.join(format!("{name}.{e}")).exists())
+    };
+    let mut name = stem.clone();
+    let mut n = 0;
+    while taken(&name) {
+        n += 1;
+        name = format!("{stem} ({n})");
+    }
+    dir.join(format!("{name}.{ext}"))
 }
 
 /// Borra el parcial y su estado de reanudación de una descarga cancelada.

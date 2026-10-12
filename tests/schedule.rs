@@ -75,6 +75,7 @@ async fn la_cola_programada_ignora_lo_pausado_y_lo_ya_terminado() {
         path: dir.path().join(format!("{id}.bin")),
         state,
         bytes: 0,
+        via_ytdlp: false,
     };
     let all = vec![
         rec("p", State::Paused),
