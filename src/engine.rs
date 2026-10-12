@@ -29,7 +29,7 @@ const DEFAULT_ATTEMPTS: u32 = 4;
 const FLUSH_EVERY: usize = 16;
 const HASH_BLOCK: usize = 1 << 20;
 /// Periodo de muestreo para decidir cuántas conexiones usar.
-const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 /// Muestras sin mejora seguidas antes de dejar de añadir conexiones.
 const FLAT_SAMPLES_TO_STOP: u32 = 3;
 

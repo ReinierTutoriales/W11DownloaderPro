@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Conexiones con las que se empieza. Se añaden más solo si la velocidad total lo justifica.
-pub const START_CONNECTIONS: usize = 2;
+pub const START_CONNECTIONS: usize = 4;
 /// Ganancia mínima de velocidad total para justificar una conexión más (10 %).
 pub const RAMP_GAIN: f64 = 1.10;
 
