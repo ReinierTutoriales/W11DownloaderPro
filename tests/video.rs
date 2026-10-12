@@ -30,6 +30,7 @@ async fn pagina_con_video_se_resuelve_y_descarga_intacta() {
     let opts = ProbeOptions {
         python: Some(py),
         cookies: None,
+        ffmpeg: None,
     };
     let choice = video::probe(&page, &opts)
         .await
@@ -59,6 +60,7 @@ async fn pagina_sin_video_da_error_claro() {
     let opts = ProbeOptions {
         python: Some(py),
         cookies: None,
+        ffmpeg: None,
     };
     let err = video::probe(&format!("http://{addr}/"), &opts)
         .await
@@ -71,6 +73,7 @@ async fn sin_python_configurado_el_error_indica_setup() {
     let opts = ProbeOptions {
         python: None,
         cookies: None,
+        ffmpeg: None,
     };
     let err = video::probe("http://127.0.0.1:9/", &opts)
         .await

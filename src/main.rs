@@ -109,11 +109,14 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     let mut url = cli.url.clone();
     let mut headers = Vec::new();
     let mut default_output = default_name(&cli.url);
+    let mut merge: Option<w11dl::merge::MergeJob> = None;
     if cli.video {
         let opts = video::ProbeOptions {
             python: cli.python.clone().or_else(video::default_python),
             cookies: cli.cookies.clone(),
+            ffmpeg: video::find_ffmpeg().await,
         };
+        let ffmpeg = opts.ffmpeg.clone();
         let choice = match video::probe(&cli.url, &opts).await {
             Ok(choice) => choice,
             Err(e) => {
@@ -129,6 +132,19 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                 .map_or("resolución desconocida".into(), |h| format!("{h}p"))
         );
         default_output = PathBuf::from(&choice.filename);
+        if let (Some(audio), Some(ffmpeg)) = (choice.audio, ffmpeg) {
+            merge = Some(w11dl::merge::MergeJob {
+                video: w11dl::merge::Track {
+                    url: choice.url.clone(),
+                    headers: header_map(&choice.headers),
+                },
+                audio: w11dl::merge::Track {
+                    url: audio.url,
+                    headers: header_map(&audio.headers),
+                },
+                ffmpeg,
+            });
+        }
         url = choice.url;
         headers = choice.headers;
     }
@@ -145,7 +161,17 @@ async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     opts.progress = Some(Arc::clone(&progress));
     opts.limiter = limiter(&cli.limit);
 
-    let result = download(opts).await;
+    let result = match merge {
+        Some(job) => {
+            match w11dl::merge::download_merged(opts, job, w11dl::engine::Control::default()).await
+            {
+                Ok(w11dl::engine::Outcome::Completed(report)) => Ok(report),
+                Ok(_) => Err(w11dl::Error::Video("descarga interrumpida".into())),
+                Err(e) => Err(e),
+            }
+        }
+        None => download(opts).await,
+    };
     reporter.abort();
     eprintln!();
 

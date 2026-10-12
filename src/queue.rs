@@ -58,6 +58,9 @@ pub struct Entry {
     pub record: Record,
     pub control: Control,
     pub headers: HeaderMap,
+    /// Pistas separadas de un vídeo que se une con ffmpeg. Solo en memoria, como las cabeceras:
+    /// los enlaces firmados caducan, así que no se guardan en disco.
+    pub merge: Option<crate::merge::MergeJob>,
 }
 
 /// Cola compartida por las tareas del host.
@@ -80,6 +83,7 @@ impl Registry {
                     record,
                     control: Control::default(),
                     headers: HeaderMap::new(),
+                    merge: None,
                 }
             })
             .collect();
@@ -93,6 +97,7 @@ impl Registry {
             record,
             control: control.clone(),
             headers,
+            merge: None,
         };
         self.lock().push(entry);
         control

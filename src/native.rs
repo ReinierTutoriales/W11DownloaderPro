@@ -276,6 +276,7 @@ where
                         output: entry.record.path.clone(),
                         headers: entry.headers.clone(),
                         control,
+                        merge: entry.merge.clone(),
                     };
                     let _ = tx.send(Outgoing::Accepted {
                         id: id.clone(),
@@ -336,6 +337,8 @@ struct Job {
     output: PathBuf,
     headers: HeaderMap,
     control: Control,
+    /// Imagen y sonido por separado: se descargan ambos y se unen con ffmpeg.
+    merge: Option<crate::merge::MergeJob>,
 }
 
 /// Valida la petición antes de aceptarla: URL web, cabeceras permitidas y nombre seguro.
@@ -373,6 +376,7 @@ fn prepare(
         output,
         headers: map,
         control: Control::default(),
+        merge: None,
     })
 }
 
@@ -392,7 +396,9 @@ async fn run_video(
     let opts = crate::video::ProbeOptions {
         python: crate::video::default_python(),
         cookies: None,
+        ffmpeg: crate::video::find_ffmpeg().await,
     };
+    let ffmpeg = opts.ffmpeg.clone();
     let choice = match crate::video::probe(&page, &opts).await {
         Ok(choice) => choice,
         Err(e) => {
@@ -434,12 +440,40 @@ async fn run_video(
         },
         headers.clone(),
     );
+    // Con sonido aparte hace falta ffmpeg; `probe` ya garantiza que existe si devuelve una pareja.
+    let merge = match (choice.audio, ffmpeg) {
+        (Some(audio), Some(ffmpeg)) => {
+            let mut audio_headers = HeaderMap::new();
+            for (name, value) in &audio.headers {
+                if let (Ok(n), Ok(v)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    audio_headers.append(n, v);
+                }
+            }
+            Some(crate::merge::MergeJob {
+                video: crate::merge::Track {
+                    url: choice.url.clone(),
+                    headers: headers.clone(),
+                },
+                audio: crate::merge::Track {
+                    url: audio.url,
+                    headers: audio_headers,
+                },
+                ffmpeg,
+            })
+        }
+        _ => None,
+    };
+    registry.update(&id, |e| e.merge = merge.clone());
     let job = Job {
         id,
         url: choice.url,
         output,
         headers,
         control,
+        merge,
     };
     run(job, tx, registry, out_dir, limiter).await;
 }
@@ -476,7 +510,10 @@ async fn run(
     opts.progress = Some(Arc::clone(&progress));
     opts.limiter = Some(limiter);
 
-    let result = engine::download_controlled(opts, job.control).await;
+    let result = match job.merge {
+        Some(merge) => crate::merge::download_merged(opts, merge, job.control).await,
+        None => engine::download_controlled(opts, job.control).await,
+    };
     reporter.abort();
 
     let message = match result {
@@ -553,6 +590,7 @@ pub async fn run_pending(out_dir: PathBuf) -> crate::schedule::Summary {
             output: record.path,
             headers: HeaderMap::new(),
             control,
+            merge: None,
         };
         let (slots, tx, registry, out_dir, limiter) = (
             Arc::clone(&slots),
