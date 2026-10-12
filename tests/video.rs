@@ -63,7 +63,7 @@ async fn pagina_sin_video_da_error_claro() {
     let err = video::probe(&format!("http://{addr}/"), &opts)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("vídeo"), "{err}");
+    assert!(matches!(err, w11dl::Error::Video(_)), "{err}");
 }
 
 #[tokio::test]

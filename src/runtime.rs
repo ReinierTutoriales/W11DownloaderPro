@@ -6,6 +6,9 @@ use std::process::Command;
 
 use crate::error::{Error, Result};
 
+/// Página oficial de descarga de Python: el enlace que se muestra cuando falta la dependencia.
+pub const PYTHON_DOWNLOAD_URL: &str = "https://www.python.org/downloads/";
+
 /// Lock con la versión y los hashes SHA-256 de PyPI.
 pub const REQUIREMENTS_LOCK: &str = include_str!("../packaging/requirements.lock");
 /// Versión de yt-dlp que fija el lock (formato de PyPI).
@@ -84,23 +87,35 @@ fn base_candidates() -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// Primer Python 3.10+ que responda. Devuelve el programa y los argumentos previos.
+/// Primer Python 3.10+ que responda. Si hay Python pero es antiguo, lo dice explícitamente.
 fn find_base_python() -> Result<(String, Vec<String>)> {
+    let mut found_old: Option<String> = None;
     for (program, args) in base_candidates() {
         let probe = Command::new(&program)
             .args(&args)
             .args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"])
             .output();
-        if let Ok(out) = probe {
-            if out.status.success()
-                && parse_python_version(&String::from_utf8_lossy(&out.stdout)).is_some()
-            {
-                return Ok((program, args));
-            }
+        let Ok(out) = probe else { continue };
+        if !out.status.success() {
+            continue;
         }
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if parse_python_version(&text).is_some() {
+            return Ok((program, args));
+        }
+        found_old.get_or_insert(format!("{program} {text}"));
     }
-    Err(Error::Setup(
-        "no encuentro Python 3.10 o superior; instálalo y vuelve a ejecutar setup".into(),
+    Err(missing_python_error(found_old.as_deref()))
+}
+
+/// Motivo claro y enlace cuando no hay un Python utilizable.
+pub fn missing_python_error(found_old: Option<&str>) -> Error {
+    let reason = match found_old {
+        Some(found) => format!("el Python que hay ({found}) es anterior a 3.10"),
+        None => "no encuentro Python en este equipo".to_owned(),
+    };
+    Error::Setup(format!(
+        "{reason}. Instala Python 3.10 o superior desde {PYTHON_DOWNLOAD_URL} y ejecuta w11dl-host setup"
     ))
 }
 
@@ -171,10 +186,14 @@ pub fn setup(data: &Path) -> Result<Status> {
 pub fn check(data: &Path) -> Status {
     let python = venv_python(data);
     if !python.exists() {
+        let message = match find_base_python() {
+            Ok(_) => "entorno no creado: ejecuta w11dl-host setup".to_owned(),
+            Err(e) => format!("vídeo no disponible: {e}"),
+        };
         return Status {
             ready: false,
             python: None,
-            message: "entorno no creado: ejecuta w11dl-host setup".into(),
+            message,
         };
     }
     match run(&python, &["-m", "yt_dlp", "--version"]) {
@@ -228,6 +247,19 @@ mod tests {
             REQUIREMENTS_LOCK
                 .contains("1d57897e94c6665a0a6f9bc54b34e584284e32c034ffab3a7df25d8f7b24eedf")
         );
+    }
+
+    #[test]
+    fn falta_python_da_motivo_y_enlace() {
+        let none = missing_python_error(None).to_string();
+        assert!(none.contains("no encuentro Python"), "{none}");
+        assert!(none.contains(PYTHON_DOWNLOAD_URL), "{none}");
+        let old = missing_python_error(Some("python3 3.9")).to_string();
+        assert!(
+            old.contains("python3 3.9") && old.contains("anterior a 3.10"),
+            "{old}"
+        );
+        assert!(old.contains(PYTHON_DOWNLOAD_URL));
     }
 
     #[test]

@@ -61,7 +61,10 @@ pub struct ProbeOptions {
 pub async fn probe(page: &str, opts: &ProbeOptions) -> Result<Choice> {
     // Sin intérprete configurado no se adivina: un `python` del PATH sin yt-dlp daría errores confusos.
     let python = opts.python.clone().ok_or_else(|| {
-        Error::Video("yt-dlp no está preparado: ejecuta w11dl-host setup o indica --python".into())
+        Error::Video(format!(
+            "vídeo no disponible: falta el entorno de yt-dlp. Ejecuta w11dl-host setup o indica --python (Python 3.10+: {})",
+            crate::runtime::PYTHON_DOWNLOAD_URL
+        ))
     })?;
     let mut cmd = Command::new(&python);
     cmd.arg("-m").arg("yt_dlp").args([
@@ -85,7 +88,10 @@ pub async fn probe(page: &str, opts: &ProbeOptions) -> Result<Choice> {
         .map_err(|_| Error::Video("yt-dlp tardó demasiado".into()))?
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
-                Error::Video("el Python configurado no existe: ejecuta w11dl-host setup".into())
+                Error::Video(format!(
+                    "vídeo no disponible: el Python configurado no existe. Ejecuta w11dl-host setup ({})",
+                    crate::runtime::PYTHON_DOWNLOAD_URL
+                ))
             }
             _ => Error::Video(format!("no se pudo ejecutar yt-dlp: {e}")),
         })?;

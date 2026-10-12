@@ -52,7 +52,12 @@ fn run_register(args: &[String]) -> std::io::Result<String> {
     let host_exe = std::env::current_exe()?;
     let written = register::register(&host_exe, &targets, &manifest_dir())?;
     let list: Vec<String> = written.iter().map(|p| p.display().to_string()).collect();
-    Ok(format!("Registrado: {}", list.join(", ")))
+    // La instalación se completa aunque falte una dependencia: el vídeo queda deshabilitado y se explica por qué.
+    let video = match runtime::setup(&runtime::data_dir()) {
+        Ok(st) => format!("Vídeo: {}", st.message),
+        Err(e) => format!("Vídeo no disponible (la descarga normal funciona igual): {e}"),
+    };
+    Ok(format!("Registrado: {}\n{video}", list.join(", ")))
 }
 
 fn finish(result: std::io::Result<String>) -> ExitCode {
