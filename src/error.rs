@@ -35,6 +35,9 @@ pub enum Error {
     #[error("el estado de reanudación no es válido: {0}")]
     CorruptState(#[from] serde_json::Error),
 
+    #[error("vídeo: {0}")]
+    Video(String),
+
     #[error("hash SHA-256 no coincide: esperado {expected}, obtenido {actual}")]
     HashMismatch { expected: String, actual: String },
 

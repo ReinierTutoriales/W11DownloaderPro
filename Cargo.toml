@@ -8,7 +8,7 @@ description = "Motor de descargas acelerado para Windows 11"
 publish = false
 
 [dependencies]
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "sync", "net", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "sync", "net", "time", "process"] }
 hyper = { version = "1.12", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "client-proxy", "client-proxy-system", "http1", "http2", "tokio"] }
 hyper-rustls = { version = "0.27.10", features = ["http2", "native-tokio"] }

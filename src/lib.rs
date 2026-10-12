@@ -9,6 +9,7 @@ pub mod net;
 pub mod plan;
 pub mod proxy;
 pub mod register;
+pub mod video;
 
 pub use engine::{Mode, Options, Report, download};
 pub use error::{Error, Result};

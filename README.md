@@ -47,3 +47,16 @@ w11dl-host.exe unregister                                     # quita el registr
 - Solo se aceptan URL `http`/`https` y las cabeceras `Cookie`, `Referer`, `User-Agent` y `Accept-Language`.
 - Las cabeceras de sesión solo se envían al host original; una redirección a otro dominio no las recibe.
 - Las descargas van a `%USERPROFILE%\Downloads` por defecto, con `--out-dir` para cambiarlo. Nunca se sobrescribe un archivo existente: se añade ` (2)`, ` (3)`…
+
+## Vídeo con yt-dlp (fase 2, primera parte)
+
+`--video` resuelve una página con yt-dlp y descarga el mejor vídeo directo:
+
+```
+w11dl <URL_PAGINA> --video [--python ruta\a\python.exe] [--cookies cookies.txt] [-c 8]
+```
+
+- **Dependencia**: Python 3.10+ con `yt-dlp==2026.08.19` (`pip install yt-dlp==2026.08.19`). Por defecto usa `W11DL_PYTHON` o `python`.
+- **Qué elige**: formatos HTTP/HTTPS directos (mp4, webm, mkv, mov) con vídeo, priorizando los que traen audio y después la resolución más alta.
+- **Qué descarta**: contenido con DRM y streams segmentados HLS/DASH (previstos para la fase 2).
+- **Cookies**: nunca por defecto. Solo con `--cookies`, con un archivo Netscape de tu propia sesión. Usarlas puede llevar a bloqueo de cuenta en algunos sitios; la responsabilidad es del usuario.

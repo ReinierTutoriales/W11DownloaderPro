@@ -8,7 +8,7 @@ use clap::Parser;
 use w11dl::crawl::{self, CrawlOptions};
 use w11dl::engine::{DEFAULT_CONNECTIONS, DEFAULT_MAX_CHUNK};
 use w11dl::proxy::ProxyMode;
-use w11dl::{Mode, Options, Report, download, naming, net};
+use w11dl::{Mode, Options, Report, download, naming, net, video};
 
 /// Descarga acelerada: segmentación por rangos, reanudación, verificación SHA-256,
 /// proxy y rastreo de sitios para capturar archivos.
@@ -62,6 +62,18 @@ struct Cli {
     #[arg(long, default_value_t = 500)]
     delay_ms: u64,
 
+    /// Resuelve la página con yt-dlp y descarga el mejor vídeo directo sin DRM.
+    #[arg(long, conflicts_with = "crawl")]
+    video: bool,
+
+    /// Python con yt-dlp instalado (`python -m yt_dlp`). Por defecto, `W11DL_PYTHON` o `python`.
+    #[arg(long, requires = "video")]
+    python: Option<PathBuf>,
+
+    /// Cookies Netscape de la sesión del usuario. Solo se usan si se indica explícitamente.
+    #[arg(long, requires = "video")]
+    cookies: Option<PathBuf>,
+
     /// Solo lista los archivos encontrados, sin descargarlos.
     #[arg(long, requires = "crawl")]
     dry_run: bool,
@@ -90,15 +102,42 @@ async fn main() -> ExitCode {
 }
 
 async fn run_single(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
-    let output = cli.output.unwrap_or_else(|| default_name(&cli.url));
+    let mut url = cli.url.clone();
+    let mut headers = Vec::new();
+    let mut default_output = default_name(&cli.url);
+    if cli.video {
+        let opts = video::ProbeOptions {
+            python: cli.python.clone().or_else(video::default_python),
+            cookies: cli.cookies.clone(),
+        };
+        let choice = match video::probe(&cli.url, &opts).await {
+            Ok(choice) => choice,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return Ok(false);
+            }
+        };
+        eprintln!(
+            "Vídeo: {} ({})",
+            choice.filename,
+            choice
+                .height
+                .map_or("resolución desconocida".into(), |h| format!("{h}p"))
+        );
+        default_output = PathBuf::from(&choice.filename);
+        url = choice.url;
+        headers = choice.headers;
+    }
+    let output = cli.output.unwrap_or(default_output);
     let progress = Arc::new(AtomicU64::new(0));
     let reporter = spawn_reporter(Arc::clone(&progress));
 
-    let mut opts = Options::new(cli.url, output.clone());
+    let mut opts = Options::new(url, output.clone());
     opts.connections = cli.connections.max(1);
     opts.max_chunk = cli.max_chunk;
     opts.sha256 = cli.sha256;
     opts.proxy = proxy_mode(&cli.proxy, cli.no_proxy);
+    opts.headers = header_map(&headers);
     opts.progress = Some(Arc::clone(&progress));
 
     let result = download(opts).await;
@@ -168,6 +207,20 @@ async fn run_crawl(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     Ok(all_ok)
+}
+
+/// Convierte las cabeceras de yt-dlp en un mapa válido; las que no son válidas se omiten.
+fn header_map(pairs: &[(String, String)]) -> hyper::header::HeaderMap {
+    let mut map = hyper::header::HeaderMap::new();
+    for (name, value) in pairs {
+        if let (Ok(n), Ok(v)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            map.append(n, v);
+        }
+    }
+    map
 }
 
 fn proxy_mode(explicit: &Option<String>, direct: bool) -> ProxyMode {
