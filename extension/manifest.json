@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "W11DownloaderPro",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Captura descargas y enlaces de archivos y los envía al acelerador W11DownloaderPro.",
   "browser_specific_settings": {
     "gecko": {

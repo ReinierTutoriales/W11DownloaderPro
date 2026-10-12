@@ -1,0 +1,76 @@
+W11DownloaderPro 0.0.1 — VERSIÓN DE PRUEBAS
+==========================================
+
+Esto es una versión de pruebas, no estable y sin firmar. Se ha compilado y verificado en Linux
+(pruebas automáticas); en Windows 11 NO se ha ejecutado todavía. Tu prueba es la primera.
+Windows puede mostrar un aviso de SmartScreen porque los .exe no están firmados.
+
+Qué incluye
+-----------
+  w11dl.exe        Línea de órdenes: w11dl <url> -o archivo.zip   (opciones: w11dl --help)
+  w11dl-host.exe   Host de mensajería nativa para el navegador (register, setup, run-queue...)
+  extension\       Extensión de Firefox (se carga como complemento temporal)
+  requirements.lock  Versión fijada de yt-dlp (la usa "w11dl-host.exe setup")
+
+Requisitos
+----------
+  - Windows 11 de 64 bits y Firefox 128 o superior.
+  - Opcional, para vídeo: Python 3.10 o superior  https://www.python.org/downloads/
+  - Opcional, para vídeo con imagen y sonido separados, HLS y DASH: ffmpeg
+    https://ffmpeg.org/download.html   (debe estar en el PATH, o define W11DL_FFMPEG con su ruta)
+  Sin Python o sin ffmpeg, las descargas normales funcionan igual; el vídeo te dirá qué falta.
+
+Instalación
+-----------
+  1. Descomprime la carpeta en un lugar PERMANENTE (por ejemplo C:\W11DownloaderPro).
+     El registro guarda la ruta de w11dl-host.exe: si la mueves, repite el paso 2.
+  2. En PowerShell, dentro de esa carpeta:
+        .\w11dl-host.exe register --firefox-id w11dl@reiniertutoriales
+     Esto escribe un manifiesto en %LOCALAPPDATA%\W11DownloaderPro y una clave en
+     HKCU\Software\Mozilla\NativeMessagingHosts (solo tu usuario; no hace falta ser administrador).
+     También intenta preparar yt-dlp; si falta Python lo dice y sigue.
+  3. En Firefox abre  about:debugging#/runtime/this-firefox  → "Cargar complemento temporal…" →
+     elige  extension\manifest.json
+     El complemento temporal se quita al cerrar Firefox; hay que cargarlo de nuevo cada vez.
+  4. Las descargas se guardan en tu carpeta Descargas (%USERPROFILE%\Downloads).
+
+Qué probar (y qué contarme)
+---------------------------
+  1. Descarga normal: pulsa un enlace a un .zip/.exe/.iso grande. Debe aparecer "Capturada" y el
+     archivo en Descargas. ¿Se abre la ventana de descarga de Firefox o la toma el acelerador?
+  2. Enlace con sesión iniciada (cookies): descarga algo que exija iniciar sesión.
+  3. Popup de la extensión: cola, pausar, reanudar, cancelar, límite de velocidad, "dejar en espera".
+  4. Botón sobre vídeos: pasa el ratón por un vídeo; arriba a la derecha debe salir "Descargar vídeo".
+     Prueba una página con un .mp4 directo, YouTube y otro sitio. Anota cuáles funcionan.
+  5. Pantalla completa: ¿el botón sigue visible?
+  6. Reanudar: pausa una descarga grande y reanúdala. Cierra Firefox a mitad y comprueba qué pasa.
+  7. Si el host no responde, la descarga debe quedar en Firefox (respaldo). Cuéntame si pasa.
+  Para cada fallo: la acción, el sitio, el mensaje exacto y la versión de Firefox. Para el rendimiento:
+  define  W11DL_TRACE=1  y ejecuta  .\w11dl.exe <url> -c 8  desde PowerShell; copia las líneas [trace].
+
+Línea de órdenes (útil para aislar problemas)
+---------------------------------------------
+  .\w11dl.exe https://sitio/archivo.zip -o archivo.zip -c 8
+  .\w11dl.exe https://sitio/archivo.zip --limit 2M          (límite de velocidad)
+  .\w11dl.exe "https://sitio/pagina-con-video" --video      (necesita Python+yt-dlp; ffmpeg para HLS)
+  .\w11dl-host.exe status                                    (¿está listo el entorno de vídeo?)
+
+Programar una cola (opcional, sin verificar en Windows)
+-------------------------------------------------------
+  .\w11dl-host.exe schedule --at 2026-10-14T03:00 --after nothing
+  .\w11dl-host.exe unschedule
+  --after acepta nothing, sleep, hibernate o shutdown (el apagado espera 60 s; se aborta con shutdown /a).
+
+Límites conocidos de esta versión
+---------------------------------
+  - Solo se capturan navegaciones por GET; las descargas por POST las hace Firefox.
+  - No se capturan descargas generadas por JavaScript (blob:, fetch/XHR) ni de iframes.
+  - Sin ETag fuerte ni Last-Modified en el servidor, una descarga interrumpida empieza de cero.
+  - El vídeo con DRM y las emisiones en directo no se pueden descargar.
+  - Los vídeos por HLS/DASH los baja yt-dlp (no el motor propio); sin cookies del navegador.
+  - Usa el vídeo respetando los términos de cada sitio y la ley de tu país.
+
+Desinstalar
+-----------
+  .\w11dl-host.exe unregister      (quita el registro) y borra la carpeta.
+  Si programaste una cola:  .\w11dl-host.exe unschedule
