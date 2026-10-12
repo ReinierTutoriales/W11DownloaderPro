@@ -106,3 +106,67 @@ test("descarga en espera: el mensaje lo marca y las acciones permiten iniciarla"
   assert.equal("queued" in core.enqueueMessage({ id: "1", url: "https://x.test/a", filename: "a" }), false);
   assert.deepEqual(core.queueActions("queued"), ["resume", "cancel"]);
 });
+
+test("botón de vídeo: solo para vídeos reales y sin DRM", () => {
+  const base = { width: 640, height: 360, visible: true, loop: false, muted: false, drm: false };
+  assert.equal(core.videoButtonState(base).show, true);
+  assert.deepEqual(core.videoButtonState({ ...base, drm: true }), { show: false, reason: "drm" });
+  assert.equal(core.videoButtonState({ ...base, visible: false }).show, false);
+  assert.equal(core.videoButtonState({ ...base, width: 150 }).show, false);
+  assert.equal(core.videoButtonState({ ...base, height: 100 }).show, false);
+  assert.equal(core.videoButtonState({ ...base, loop: true, muted: true }).reason, "decorativo");
+  assert.equal(core.videoButtonState({ ...base, loop: true, muted: false }).show, true);
+  assert.equal(core.videoButtonState({ ...base, width: undefined }).show, false);
+});
+
+test("destino del vídeo: archivo directo o página para yt-dlp", () => {
+  const page = "https://sitio.test/ver?v=1";
+  assert.deepEqual(core.videoTarget({ currentSrc: "https://cdn.test/a/clip.mp4?t=1", pageUrl: page }), {
+    kind: "direct",
+    url: "https://cdn.test/a/clip.mp4?t=1",
+  });
+  // blob:, data: y listas de reproducción no son archivos.
+  for (const src of ["blob:https://sitio.test/uuid", "data:video/mp4;base64,AAAA", "https://cdn.test/live.m3u8", ""]) {
+    assert.deepEqual(core.videoTarget({ currentSrc: src, pageUrl: page }), { kind: "page", url: page });
+  }
+  // En un iframe se prefiere la URL del propio reproductor.
+  assert.deepEqual(
+    core.videoTarget({ currentSrc: "blob:x", frameUrl: "https://player.test/embed/9", pageUrl: page }),
+    { kind: "page", url: "https://player.test/embed/9" }
+  );
+  assert.equal(core.videoTarget({ currentSrc: "blob:x", frameUrl: "about:blank", pageUrl: "file:///x" }), null);
+});
+
+test("posición del botón: esquina superior derecha, dentro de la ventana", () => {
+  const vp = { width: 1000, height: 700 };
+  const rect = { left: 100, top: 50, right: 740, bottom: 410 };
+  const pos = core.buttonPosition(rect, vp);
+  assert.deepEqual(pos, { left: 740 - core.BUTTON_WIDTH - 8, top: 58 });
+  // Vídeo que sobresale por la derecha: el botón queda dentro de la ventana.
+  const wide = core.buttonPosition({ left: 100, top: 50, right: 1400, bottom: 410 }, vp);
+  assert.equal(wide.left, 1000 - core.BUTTON_WIDTH - 8);
+  // Parcialmente arriba: el botón baja al borde visible.
+  assert.equal(core.buttonPosition({ left: 0, top: -200, right: 640, bottom: 160 }, vp).top, 8);
+  // Fuera de la ventana o casi sin altura visible: sin botón.
+  assert.equal(core.buttonPosition({ left: 0, top: 800, right: 640, bottom: 1100 }, vp), null);
+  assert.equal(core.buttonPosition({ left: 1200, top: 0, right: 1800, bottom: 300 }, vp), null);
+  assert.equal(core.buttonPosition({ left: 0, top: -190, right: 640, bottom: -160 }, vp), null);
+  assert.equal(core.pointInRect(150, 100, rect), true);
+  assert.equal(core.pointInRect(50, 100, rect), false);
+});
+
+test("el fondo valida los clics de vídeo y rechaza todo lo demás", () => {
+  const ok = core.videoClickMessage({ kind: "page", url: "https://sitio.test/v" });
+  assert.equal(core.validVideoClick(ok), true);
+  for (const bad of [
+    null,
+    {},
+    { ...ok, kind: "otro" },
+    { ...ok, url: "file:///etc/passwd" },
+    { ...ok, url: "javascript:alert(1)" },
+    { ...ok, url: "https://x.test/" + "a".repeat(5000) },
+    { ...ok, type: "queue-action" },
+  ]) {
+    assert.equal(core.validVideoClick(bad), false);
+  }
+});

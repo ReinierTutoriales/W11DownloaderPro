@@ -37,12 +37,22 @@ La extensión queda activa hasta cerrar Firefox. Para una instalación permanent
 
 No se envía nada a servidores de terceros. Todo el tráfico va del navegador al host en tu equipo, y del host a los servidores que indiques.
 
+## Botón sobre los vídeos
+
+Al pasar el puntero por un vídeo aparece **⬇ Descargar vídeo** en su esquina superior derecha. Un clic lo envía al acelerador: un archivo directo (`.mp4`, `.webm`…) va por el motor con las cookies de la sesión; el resto (YouTube, `blob:`, reproductores incrustados) se manda como página a yt-dlp. Nunca se descarga nada sin ese clic.
+
+- No aparece en vídeos pequeños, decorativos (en bucle y sin sonido) ni protegidos con DRM (`mediaKeys` o evento `encrypted`). Si el reproductor aún no pidió las claves, el botón puede aparecer y yt-dlp fallar después con un aviso.
+- Se activa o desactiva desde el popup.
+- Límites conocidos: no ve vídeos dentro de un Shadow DOM cerrado de la propia página.
+
 ## Pruebas
 
 ```
 npm test                 # lógica, protocolo y vídeo (Node 22+; vídeo requiere W11DL_PYTHON)
 FIREFOX_BIN=ruta/firefox npm run test:firefox   # extremo a extremo en Firefox real
 ```
+
+`npm run test:dom` (con Playwright disponible) comprueba el botón en Chromium real: aparición, clic, scroll, ocultación y exclusiones. No es Firefox.
 
 `test:firefox` necesita el host compilado (`cargo build`). Cubre dos escenarios: captura con el host funcionando, y respaldo en el navegador con el host roto.
 

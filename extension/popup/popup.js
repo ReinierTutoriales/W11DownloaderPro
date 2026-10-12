@@ -4,7 +4,14 @@ const status = (text) => { $("status").textContent = text; };
 async function init() {
   const { enabled } = await browser.runtime.sendMessage({ type: "get-enabled" });
   $("enabled").checked = enabled;
+  const stored = await browser.storage.local.get("videoButton");
+  $("video-button").checked = stored.videoButton !== false;
 }
+
+// Lo lee el script de contenido de cada pestaña; por defecto activado.
+$("video-button").addEventListener("change", (e) =>
+  browser.storage.local.set({ videoButton: e.target.checked })
+);
 
 $("enabled").addEventListener("change", (e) =>
   browser.runtime.sendMessage({ type: "set-enabled", enabled: e.target.checked })

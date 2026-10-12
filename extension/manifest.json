@@ -33,5 +33,19 @@
   "action": {
     "default_title": "W11DownloaderPro",
     "default_popup": "popup/popup.html"
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "lib/core.js",
+        "content/video-button.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
 }

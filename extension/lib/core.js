@@ -171,6 +171,69 @@
     return { type: "set_limit", bytes_per_sec: bytesPerSec };
   }
 
+  // ---- Botón sobre los vídeos ----
+
+  // Contenedores que el motor descarga como archivo directo (espejo de DIRECT_VIDEO_EXTS en el host).
+  const DIRECT_VIDEO_EXTENSIONS = ["mp4", "webm", "mkv", "mov"];
+  const MIN_VIDEO_WIDTH = 200;
+  const MIN_VIDEO_HEIGHT = 120;
+  const BUTTON_WIDTH = 132;
+  const BUTTON_HEIGHT = 30;
+  const BUTTON_MARGIN = 8;
+
+  // ¿Merece un botón este vídeo? Excluye los pequeños, los ocultos, los decorativos (en bucle y sin
+  // sonido, típicos de fondos de portada) y los que usan DRM, que no se pueden descargar.
+  function videoButtonState({ width, height, visible, loop, muted, drm }) {
+    if (drm) return { show: false, reason: "drm" };
+    if (!visible) return { show: false, reason: "oculto" };
+    if (!(width >= MIN_VIDEO_WIDTH) || !(height >= MIN_VIDEO_HEIGHT)) return { show: false, reason: "pequeño" };
+    if (loop && muted) return { show: false, reason: "decorativo" };
+    return { show: true, reason: "" };
+  }
+
+  // Qué se envía al host: el archivo directo si el vídeo lo es, o la página para que yt-dlp la resuelva.
+  // `blob:`, `data:` y el streaming por segmentos no son archivos: solo sirve la página.
+  function videoTarget({ currentSrc, frameUrl, pageUrl }) {
+    if (isWebUrl(currentSrc)) {
+      const ext = extensionOf(new URL(currentSrc).pathname.split("/").pop() || "");
+      if (DIRECT_VIDEO_EXTENSIONS.includes(ext)) return { kind: "direct", url: currentSrc };
+    }
+    for (const candidate of [frameUrl, pageUrl]) {
+      if (isWebUrl(candidate)) return { kind: "page", url: candidate };
+    }
+    return null;
+  }
+
+  // Esquina superior derecha del vídeo, dentro de la ventana. `null` si el vídeo no se ve.
+  function buttonPosition(rect, viewport) {
+    const left = Math.min(rect.right, viewport.width) - BUTTON_WIDTH - BUTTON_MARGIN;
+    const top = Math.max(rect.top, 0) + BUTTON_MARGIN;
+    const visibleHeight = Math.min(rect.bottom, viewport.height) - Math.max(rect.top, 0);
+    if (rect.right <= 0 || rect.left >= viewport.width || visibleHeight < BUTTON_HEIGHT + BUTTON_MARGIN) {
+      return null;
+    }
+    return { left: Math.max(left, Math.max(rect.left, 0) + BUTTON_MARGIN), top };
+  }
+
+  function pointInRect(x, y, rect) {
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }
+
+  // Mensaje del script de contenido al fondo. El fondo lo valida de nuevo: no se fía del remitente.
+  function videoClickMessage(target) {
+    return { type: "video-click", kind: target.kind, url: target.url };
+  }
+
+  function validVideoClick(msg) {
+    return Boolean(
+      msg &&
+        msg.type === "video-click" &&
+        (msg.kind === "direct" || msg.kind === "page") &&
+        isWebUrl(msg.url) &&
+        msg.url.length <= 4096
+    );
+  }
+
   function enqueueVideoMessage({ id, page }) {
     return { type: "enqueue_video", id, page };
   }
@@ -194,6 +257,14 @@
     queueActions,
     LIMIT_CHOICES,
     limitMessage,
+    videoButtonState,
+    videoTarget,
+    buttonPosition,
+    pointInRect,
+    videoClickMessage,
+    validVideoClick,
+    BUTTON_WIDTH,
+    BUTTON_HEIGHT,
   };
 
   if (typeof module !== "undefined" && module.exports) {

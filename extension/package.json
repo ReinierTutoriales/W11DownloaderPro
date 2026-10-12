@@ -6,7 +6,8 @@
   "license": "UNLICENSED",
   "scripts": {
     "test": "node --test test/core.test.js test/host.e2e.test.js",
-    "test:firefox": "node test/firefox-e2e.js"
+    "test:firefox": "node test/firefox-e2e.js",
+    "test:dom": "node test/video-button.dom.js"
   },
   "engines": {
     "node": ">=22"

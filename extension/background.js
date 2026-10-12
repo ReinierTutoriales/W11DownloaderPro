@@ -320,8 +320,26 @@ function queueAction(action, id) {
   }
 }
 
-browser.runtime.onMessage.addListener(async (msg) => {
+// Clic en el botón de un vídeo. Solo lo envían los scripts de contenido de esta extensión: el
+// mensaje se valida igualmente y nunca se descarga nada que no sea una URL web.
+async function videoClick(msg, sender) {
+  if (!sender || sender.id !== browser.runtime.id || !sender.tab) return { ok: false, error: "remitente no válido" };
+  if (!self.W11DL.validVideoClick(msg)) return { ok: false, error: "petición no válida" };
+  if (msg.kind === "direct") {
+    const result = await sendOne(msg.url, sender.tab.url);
+    if (result.ok) notify("Vídeo en cola", self.W11DL.fileNameFrom(msg.url));
+    else notify("No se pudo descargar el vídeo", result.error);
+    return result;
+  }
+  // La resolución con yt-dlp puede tardar: el botón no espera, el resultado llega como notificación.
+  sendVideo(msg.url);
+  return { ok: true };
+}
+
+browser.runtime.onMessage.addListener(async (msg, sender) => {
   switch (msg && msg.type) {
+    case "video-click":
+      return videoClick(msg, sender);
     case "queue-list":
       try {
         return { items: await listQueue() };
