@@ -83,3 +83,12 @@ test("mensaje de vídeo no lleva cabeceras de sesión", () => {
     page: "https://x.test/v",
   });
 });
+
+test("acciones de la cola según el estado", () => {
+  assert.deepEqual(core.queueActions("running"), ["pause", "cancel"]);
+  assert.deepEqual(core.queueActions("paused"), ["resume", "cancel"]);
+  assert.deepEqual(core.queueActions("interrupted"), ["resume", "cancel"]);
+  assert.deepEqual(core.queueActions("failed"), ["resume", "cancel"]);
+  assert.deepEqual(core.queueActions("done"), []);
+  assert.deepEqual(core.queueActions("canceled"), []);
+});

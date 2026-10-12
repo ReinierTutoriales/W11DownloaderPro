@@ -36,9 +36,25 @@ function ensurePort() {
   return port;
 }
 
+// Respuesta pendiente de `list` (la cola completa llega como un único mensaje `queue`).
+let queueWaiter = null;
+
 function onHostMessage(msg) {
   if (!msg || typeof msg !== "object") return;
   switch (msg.type) {
+    case "queue": {
+      if (queueWaiter) {
+        queueWaiter(msg.items || []);
+        queueWaiter = null;
+      }
+      break;
+    }
+    case "paused":
+      notify("Descarga pausada", "Se reanuda desde donde se quedó.");
+      break;
+    case "canceled":
+      notify("Descarga cancelada", "Se borró lo descargado.");
+      break;
     case "accepted": {
       const pending = waiting.get(msg.id);
       if (pending) {
@@ -234,8 +250,52 @@ browser.runtime.onInstalled.addListener(() => {
   });
 });
 
+// Pide la cola al host y espera su respuesta (con tiempo máximo).
+function listQueue() {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      queueWaiter = null;
+      reject(new Error("el host no respondió"));
+    }, 5000);
+    queueWaiter = (items) => {
+      clearTimeout(timer);
+      resolve(items);
+    };
+    try {
+      ensurePort().postMessage({ type: "list" });
+    } catch (err) {
+      clearTimeout(timer);
+      queueWaiter = null;
+      port = null;
+      reject(err);
+    }
+  });
+}
+
+// Acciones de la cola: pause, resume o cancel. Sus resultados llegan como eventos del host.
+function queueAction(action, id) {
+  if (!["pause", "resume", "cancel"].includes(action)) {
+    return { ok: false, error: "acción desconocida" };
+  }
+  try {
+    ensurePort().postMessage({ type: action, id });
+    return { ok: true };
+  } catch (err) {
+    port = null;
+    return { ok: false, error: err.message };
+  }
+}
+
 browser.runtime.onMessage.addListener(async (msg) => {
   switch (msg && msg.type) {
+    case "queue-list":
+      try {
+        return { items: await listQueue() };
+      } catch (err) {
+        return { items: [], error: err.message };
+      }
+    case "queue-action":
+      return queueAction(msg.action, String(msg.id || ""));
     case "get-enabled":
       return { enabled: await getEnabled() };
     case "set-enabled":

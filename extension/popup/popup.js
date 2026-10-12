@@ -48,3 +48,60 @@ $("scan").addEventListener("click", async () => {
 });
 
 init();
+
+// ---- Cola de descargas ----
+
+const LABELS = {
+  running: "En curso",
+  paused: "Pausada",
+  interrupted: "Interrumpida (reanudable)",
+  failed: "Fallida",
+  done: "Terminada",
+  canceled: "Cancelada",
+};
+const ACTION_LABELS = { pause: "Pausar", resume: "Reanudar", cancel: "Cancelar" };
+
+function formatMb(bytes) {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderQueue(items) {
+  const list = $("queue");
+  list.replaceChildren();
+  $("queue-empty").hidden = items.length > 0;
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "job";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = item.path.split(/[\\/]/).pop();
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${LABELS[item.state] || item.state} · ${formatMb(item.bytes || 0)}`;
+    row.append(name, meta);
+    for (const action of W11DL.queueActions(item.state)) {
+      const button = document.createElement("button");
+      button.textContent = ACTION_LABELS[action];
+      button.addEventListener("click", async () => {
+        const result = await browser.runtime.sendMessage({ type: "queue-action", action, id: item.id });
+        status(result.ok ? "Orden enviada." : `No se pudo: ${result.error}`);
+        refreshQueue();
+      });
+      row.append(button);
+    }
+    list.append(row);
+  }
+}
+
+async function refreshQueue() {
+  const { items, error } = await browser.runtime.sendMessage({ type: "queue-list" });
+  if (error) {
+    status(`Cola no disponible: ${error}`);
+    return;
+  }
+  renderQueue(items);
+}
+
+$("queue-refresh").addEventListener("click", refreshQueue);
+refreshQueue();
+setInterval(refreshQueue, 2000);

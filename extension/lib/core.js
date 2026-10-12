@@ -137,6 +137,20 @@
   }
 
   // Página o enlace de vídeo: el host la resuelve con yt-dlp. Sin cabeceras de sesión.
+  // Acciones válidas sobre una descarga según su estado (espejo de `State::is_resumable` en el host).
+  function queueActions(state) {
+    switch (state) {
+      case "running":
+        return ["pause", "cancel"];
+      case "paused":
+      case "interrupted":
+      case "failed":
+        return ["resume", "cancel"];
+      default:
+        return [];
+    }
+  }
+
   function enqueueVideoMessage({ id, page }) {
     return { type: "enqueue_video", id, page };
   }
@@ -157,6 +171,7 @@
     newId,
     enqueueMessage,
     enqueueVideoMessage,
+    queueActions,
   };
 
   if (typeof module !== "undefined" && module.exports) {

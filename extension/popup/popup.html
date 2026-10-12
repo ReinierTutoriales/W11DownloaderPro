@@ -11,6 +11,12 @@
       #links { max-height: 240px; overflow: auto; border: 1px solid #8884; padding: 4px; }
       #links label { margin: 2px 0; word-break: break-all; }
       #status { margin-top: 8px; color: #666; min-height: 1em; }
+      h3 { font-size: 13px; margin: 14px 0 6px; }
+      .job { border-bottom: 1px solid #8883; padding: 6px 0; }
+      .job .name { word-break: break-all; }
+      .job .meta { color: #666; font-size: 12px; }
+      .job button { margin: 4px 4px 0 0; }
+      #queue-empty { color: #666; }
     </style>
   </head>
   <body>
@@ -19,6 +25,10 @@
     <div id="links"></div>
     <button id="send" hidden>Enviar seleccionados</button>
     <div id="status" role="status"></div>
+    <h3>Cola de descargas</h3>
+    <button id="queue-refresh">Actualizar</button>
+    <div id="queue"></div>
+    <div id="queue-empty" hidden>No hay descargas.</div>
     <script src="../lib/core.js"></script>
     <script src="popup.js"></script>
   </body>

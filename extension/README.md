@@ -21,6 +21,7 @@ La extensión queda activa hasta cerrar Firefox. Para una instalación permanent
 - **Vídeo**: clic derecho sobre la página o un enlace → *Descargar vídeo de…*. El host lo resuelve con yt-dlp (sin DRM, sin HLS/DASH en esta fase) y lo descarga. Solo se hace si lo pides; las páginas no se analizan en segundo plano. Requiere una vez `w11dl-host.exe setup` (crea el entorno de yt-dlp con hashes verificados).
 - **Buscar archivos en la página**: botón del popup. Lista los enlaces de archivo de la pestaña activa y envía los seleccionados.
 - **Interruptor** en el popup para desactivar la captura automática.
+- **Cola de descargas** en el popup: estado y progreso de cada descarga, con Pausar, Reanudar y Cancelar según corresponda. Se actualiza cada 2 segundos mientras el popup está abierto.
 
 ## Permisos y por qué se piden
 
