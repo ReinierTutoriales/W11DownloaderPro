@@ -34,6 +34,8 @@ pub struct Controller {
     best: Option<(usize, f64)>,
     flat: u32,
     settled: bool,
+    /// La primera muestra incluye el arranque de las conexiones: se descarta.
+    warmed_up: bool,
 }
 
 impl Controller {
@@ -45,6 +47,7 @@ impl Controller {
             best: None,
             flat: 0,
             settled: false,
+            warmed_up: false,
         }
     }
 
@@ -61,6 +64,10 @@ impl Controller {
     /// Procesa una muestra de velocidad total (bytes/s) medida con el número actual de conexiones.
     pub fn observe(&mut self, rate: f64) -> Step {
         if self.settled || rate <= 0.0 {
+            return Step::Hold;
+        }
+        if !self.warmed_up {
+            self.warmed_up = true;
             return Step::Hold;
         }
         let Some((best_conns, best_rate)) = self.best else {
@@ -249,6 +256,14 @@ mod tests {
         let curve = |n: usize| if n <= 4 { n as f64 * 5.0e6 } else { 12.0e6 };
         let (conns, _) = run(curve, 8);
         assert_eq!(conns, 4);
+    }
+
+    #[test]
+    fn la_primera_muestra_es_calentamiento_y_no_decide() {
+        let mut c = Controller::new(8);
+        // Velocidad artificialmente baja al arrancar: no debe contar como referencia.
+        assert_eq!(c.observe(1.0e6), Step::Hold);
+        assert_eq!(c.observe(10.0e6), Step::Set(4));
     }
 
     #[test]
