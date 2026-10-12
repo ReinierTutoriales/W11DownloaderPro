@@ -20,50 +20,16 @@ async fn tools() -> Option<(PathBuf, PathBuf)> {
     Some((py?, ffmpeg?))
 }
 
-/// Genera un HLS de unos 4 s (imagen y sonido) y devuelve sus rutas servibles.
-fn make_hls(dir: &Path) -> Vec<(String, &'static str, Vec<u8>)> {
-    let out = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=d=4:s=160x120:r=15",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=d=4",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-f",
-            "hls",
-            "-hls_time",
-            "1",
-            "-hls_playlist_type",
-            "vod",
-            "-hls_segment_filename",
-        ])
-        .arg(dir.join("seg%d.ts"))
-        .arg(dir.join("index.m3u8"))
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+/// HLS de 4 s (4 fragmentos, H.264 + AAC) guardado en `tests/fixtures/hls`: no depende de que el
+/// ffmpeg disponible incluya un codificador H.264 (las compilaciones LGPL no lo traen).
+fn make_hls(_dir: &Path) -> Vec<(String, &'static str, Vec<u8>)> {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hls");
     let mut routes = vec![(
         "/index.m3u8".to_owned(),
         "application/vnd.apple.mpegurl",
-        std::fs::read(dir.join("index.m3u8")).unwrap(),
+        std::fs::read(fixtures.join("index.m3u8")).unwrap(),
     )];
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+    for entry in std::fs::read_dir(&fixtures).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".ts") {
             routes.push((

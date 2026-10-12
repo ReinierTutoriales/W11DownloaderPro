@@ -51,7 +51,7 @@ jobs:
           dir=$(pwd)/$(ls -d dist/w11dl-*-windows-x64)
           export W11DL_PYTHON="$dir/tools/yt-dlp.exe"
           export PATH="$dir/tools:$PATH"
-          cargo test --release
+          cargo test
 
       - name: Pruebas de la extensión
         shell: bash
