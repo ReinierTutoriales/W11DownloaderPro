@@ -261,7 +261,8 @@ async fn segmented(
     });
 
     let mut set = JoinSet::new();
-    let mut controller = plan::Controller::new(max_workers);
+    let mut controller =
+        plan::Controller::with_start(max_workers, plan::start_connections(total, max_workers));
     let mut spawned = 0usize;
     let mut peak = controller.conns();
     shared.limit.store(controller.conns(), Ordering::Relaxed);

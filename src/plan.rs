@@ -4,6 +4,22 @@ use serde::{Deserialize, Serialize};
 
 /// Conexiones con las que se empieza. Desde aquí el controlador duplica mientras la velocidad suba.
 pub const START_CONNECTIONS: usize = 2;
+/// Conexiones iniciales para archivos grandes, donde la rampa desde 2 es una parte cara de la descarga.
+pub const START_CONNECTIONS_LARGE: usize = 4;
+/// Tamaño a partir del cual un archivo se considera grande para elegir las conexiones iniciales.
+pub const LARGE_FILE: u64 = 8 * 1024 * 1024;
+
+/// Conexiones con las que empezar según el tamaño. Los archivos pequeños terminan antes de que
+/// compense abrir más; los grandes ganan al saltarse parte de la rampa.
+pub fn start_connections(total: u64, max: usize) -> usize {
+    let start = if total >= LARGE_FILE {
+        START_CONNECTIONS_LARGE
+    } else {
+        START_CONNECTIONS
+    };
+    start.min(max.max(1))
+}
+
 /// Ganancia mínima de velocidad total para seguir creciendo (10 %).
 pub const RAMP_GAIN: f64 = 1.10;
 /// Caída de velocidad que indica sobrecarga (el servidor tiene tope global): se retrocede.
@@ -48,10 +64,15 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(max: usize) -> Self {
+        Self::with_start(max, START_CONNECTIONS)
+    }
+
+    /// Controlador que arranca con `start` conexiones (acotadas por `max`).
+    pub fn with_start(max: usize, start: usize) -> Self {
         let max = max.max(1);
         Self {
             max,
-            conns: START_CONNECTIONS.min(max),
+            conns: start.clamp(1, max),
             best: None,
             flat: 0,
             drops: 0,
@@ -348,6 +369,39 @@ mod tests {
             c.observe(12.0e6),
             Step::Set(4),
             "caída confirmada: vuelve al mejor punto"
+        );
+    }
+
+    #[test]
+    fn el_arranque_depende_del_tamano() {
+        assert_eq!(
+            start_connections(1024, 8),
+            START_CONNECTIONS,
+            "archivo pequeño"
+        );
+        assert_eq!(start_connections(LARGE_FILE - 1, 8), START_CONNECTIONS);
+        assert_eq!(
+            start_connections(LARGE_FILE, 8),
+            START_CONNECTIONS_LARGE,
+            "archivo grande"
+        );
+        assert_eq!(
+            start_connections(1 << 30, 2),
+            2,
+            "nunca supera el máximo permitido"
+        );
+        assert_eq!(start_connections(1 << 30, 0), 1, "máximo degenerado");
+    }
+
+    #[test]
+    fn controlador_con_arranque_alto_crece_desde_ahi() {
+        let mut c = Controller::with_start(8, 4);
+        assert_eq!(c.conns(), 4);
+        c.observe(20.0e6); // calentamiento
+        assert_eq!(
+            c.observe(20.0e6),
+            Step::Set(8),
+            "de 4 pasa directamente a 8"
         );
     }
 
