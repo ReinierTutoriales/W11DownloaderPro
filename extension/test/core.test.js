@@ -75,3 +75,11 @@ test("mensaje de encolado tiene la forma que espera el host", () => {
   const msg = core.enqueueMessage({ id: "1", url: "https://x.test/a", filename: "a", headers: undefined });
   assert.deepEqual(msg, { type: "enqueue", id: "1", url: "https://x.test/a", filename: "a", headers: {} });
 });
+
+test("mensaje de vídeo no lleva cabeceras de sesión", () => {
+  assert.deepEqual(core.enqueueVideoMessage({ id: "9", page: "https://x.test/v" }), {
+    type: "enqueue_video",
+    id: "9",
+    page: "https://x.test/v",
+  });
+});

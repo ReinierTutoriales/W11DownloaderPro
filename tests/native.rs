@@ -85,3 +85,82 @@ async fn cabecera_no_permitida_se_rechaza_sin_descargar() {
     ext_write.shutdown().await.unwrap();
     host.await.unwrap().unwrap();
 }
+
+const VIDEO_PAGE: &str = r#"<!doctype html><html><head><title>Vídeo de prueba</title></head>
+<body><video src="/clip.mp4"></video></body></html>"#;
+
+#[tokio::test]
+async fn enqueue_video_resuelve_con_ytdlp_y_descarga() {
+    // El host lee W11DL_PYTHON del entorno: aquí corre en el mismo proceso de la prueba.
+    if std::env::var_os("W11DL_PYTHON").is_none() {
+        eprintln!("omitido: define W11DL_PYTHON con un Python que tenga yt-dlp");
+        return;
+    }
+    let data = payload(300_000);
+    let (addr, _site) = serve(vec![
+        (
+            "/",
+            "text/html; charset=utf-8",
+            VIDEO_PAGE.as_bytes().to_vec(),
+        ),
+        ("/clip.mp4", "video/mp4", data.clone()),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let (host_side, ext_side) = duplex(1 << 20);
+    let (host_read, host_write) = split(host_side);
+    let (mut ext_read, mut ext_write) = split(ext_side);
+    let out = dir.path().to_path_buf();
+    let host = tokio::spawn(async move { serve_host(host_read, host_write, out).await });
+
+    write_message(
+        &mut ext_write,
+        &json!({"type": "enqueue_video", "id": "v1", "page": format!("http://{addr}/")}),
+    )
+    .await
+    .unwrap();
+
+    let first = next_for(&mut ext_read, "v1").await;
+    assert_eq!(first["type"], "probing", "{first}");
+    let accepted = next_for(&mut ext_read, "v1").await;
+    assert_eq!(accepted["type"], "accepted", "{accepted}");
+    let done = next_for(&mut ext_read, "v1").await;
+    assert_eq!(done["type"], "done", "{done}");
+
+    let saved = dir.path().join(
+        accepted["path"]
+            .as_str()
+            .unwrap()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap(),
+    );
+    assert_eq!(std::fs::read(saved).unwrap(), data);
+
+    ext_write.shutdown().await.unwrap();
+    host.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn enqueue_video_rechaza_urls_no_web() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host_side, ext_side) = duplex(1 << 20);
+    let (host_read, host_write) = split(host_side);
+    let (mut ext_read, mut ext_write) = split(ext_side);
+    let out = dir.path().to_path_buf();
+    let host = tokio::spawn(async move { serve_host(host_read, host_write, out).await });
+
+    write_message(
+        &mut ext_write,
+        &json!({"type": "enqueue_video", "id": "x", "page": "file:///etc/passwd"}),
+    )
+    .await
+    .unwrap();
+    let reply = next_for(&mut ext_read, "x").await;
+    assert_eq!(reply["type"], "error");
+    assert!(reply["message"].as_str().unwrap().contains("no web"));
+
+    ext_write.shutdown().await.unwrap();
+    host.await.unwrap().unwrap();
+}

@@ -39,12 +39,21 @@ pub enum Incoming {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+    /// Página o enlace de vídeo: el host lo resuelve con yt-dlp antes de descargar.
+    EnqueueVideo {
+        id: String,
+        page: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outgoing {
     Pong,
+    /// La resolución con yt-dlp está en curso. No es final: la petición sigue viva.
+    Probing {
+        id: String,
+    },
     Accepted {
         id: String,
         path: String,
@@ -117,6 +126,23 @@ where
         match serde_json::from_slice::<Incoming>(&raw) {
             Ok(Incoming::Ping) => {
                 let _ = tx.send(Outgoing::Pong);
+            }
+            Ok(Incoming::EnqueueVideo { id, page }) => {
+                if !is_web(&page) {
+                    let _ = tx.send(Outgoing::Error {
+                        id,
+                        message: format!("página no web: {page}"),
+                    });
+                    continue;
+                }
+                let _ = tx.send(Outgoing::Probing { id: id.clone() });
+                let slots = Arc::clone(&slots);
+                let tx = tx.clone();
+                let out_dir = out_dir.clone();
+                jobs.spawn(async move {
+                    let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+                    run_video(id, page, out_dir, tx).await;
+                });
             }
             Ok(Incoming::Enqueue {
                 id,
@@ -198,6 +224,61 @@ fn prepare(
         output,
         headers: map,
     })
+}
+
+fn is_web(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// Resuelve la página con yt-dlp y, si hay un formato, la descarga como una petición normal.
+async fn run_video(
+    id: String,
+    page: String,
+    out_dir: PathBuf,
+    tx: mpsc::UnboundedSender<Outgoing>,
+) {
+    let opts = crate::video::ProbeOptions {
+        python: crate::video::default_python(),
+        cookies: None,
+    };
+    let choice = match crate::video::probe(&page, &opts).await {
+        Ok(choice) => choice,
+        Err(e) => {
+            let _ = tx.send(Outgoing::Error {
+                id,
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+    let output = naming::unique_path(&out_dir, &choice.filename);
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        let _ = tx.send(Outgoing::Error {
+            id,
+            message: e.to_string(),
+        });
+        return;
+    }
+    let mut headers = HeaderMap::new();
+    for (name, value) in &choice.headers {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(n, v);
+        }
+    }
+    let _ = tx.send(Outgoing::Accepted {
+        id: id.clone(),
+        path: output.display().to_string(),
+    });
+    let job = Job {
+        id,
+        url: choice.url,
+        output,
+        headers,
+    };
+    run(job, tx).await;
 }
 
 async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>) {

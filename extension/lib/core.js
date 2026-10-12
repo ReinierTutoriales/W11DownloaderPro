@@ -136,6 +136,11 @@
     return { type: "enqueue", id, url, filename, headers: headers || {} };
   }
 
+  // Página o enlace de vídeo: el host la resuelve con yt-dlp. Sin cabeceras de sesión.
+  function enqueueVideoMessage({ id, page }) {
+    return { type: "enqueue_video", id, page };
+  }
+
   const api = {
     ALLOWED_HEADERS,
     FILE_EXTENSIONS,
@@ -151,6 +156,7 @@
     shouldIntercept,
     newId,
     enqueueMessage,
+    enqueueVideoMessage,
   };
 
   if (typeof module !== "undefined" && module.exports) {

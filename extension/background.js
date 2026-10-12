@@ -8,6 +8,8 @@
 
 const HOST = "com.w11dl.host";
 const HANDOFF_TIMEOUT_MS = 10000;
+// yt-dlp puede tardar hasta 120 s en resolver una página (límite del host) más un margen.
+const VIDEO_TIMEOUT_MS = 150000;
 const ENABLED_KEY = "captureEnabled";
 const MAX_LINKS_PER_SEND = 200;
 const BYPASS_TTL_MS = 30000;
@@ -66,14 +68,15 @@ function onHostMessage(msg) {
   }
 }
 
-// Envía una descarga al host y espera su acuse. Rechaza si no acepta en el plazo.
-function handoff({ url, filename, headers }) {
+// Envía una petición al host y espera su acuse final (`accepted` o `error`).
+// `build` recibe el id de la petición y devuelve el mensaje a enviar.
+function request(build, timeoutMs) {
   return new Promise((resolve, reject) => {
     const id = self.W11DL.newId();
     const timer = setTimeout(() => {
       waiting.delete(id);
       reject(new Error("el host no respondió"));
-    }, HANDOFF_TIMEOUT_MS);
+    }, timeoutMs);
     waiting.set(id, {
       resolve: (msg) => {
         clearTimeout(timer);
@@ -85,7 +88,7 @@ function handoff({ url, filename, headers }) {
       },
     });
     try {
-      ensurePort().postMessage(self.W11DL.enqueueMessage({ id, url, filename, headers }));
+      ensurePort().postMessage(build(id));
     } catch (err) {
       clearTimeout(timer);
       waiting.delete(id);
@@ -93,6 +96,16 @@ function handoff({ url, filename, headers }) {
       reject(err);
     }
   });
+}
+
+// Archivo directo: el host lo descarga. Sin acuse, el navegador conserva la descarga.
+function handoff({ url, filename, headers }) {
+  return request((id) => self.W11DL.enqueueMessage({ id, url, filename, headers }), HANDOFF_TIMEOUT_MS);
+}
+
+// Vídeo: el host resuelve la página con yt-dlp y después la descarga.
+function handoffVideo(page) {
+  return request((id) => self.W11DL.enqueueVideoMessage({ id, page }), VIDEO_TIMEOUT_MS);
 }
 
 // Cabeceras de sesión: cookies del navegador para esa URL y el referente, si lo hay.
@@ -167,9 +180,29 @@ browser.webRequest.onHeadersReceived.addListener(
 );
 
 browser.contextMenus.onClicked.addListener(async (info) => {
-  if (info.menuItemId !== "w11dl-link" || !info.linkUrl) return;
-  await sendOne(info.linkUrl, info.pageUrl);
+  if (info.menuItemId === "w11dl-link" && info.linkUrl) {
+    await sendOne(info.linkUrl, info.pageUrl);
+  } else if (info.menuItemId === "w11dl-video-link" && info.linkUrl) {
+    await sendVideo(info.linkUrl);
+  } else if (info.menuItemId === "w11dl-video-page" && info.pageUrl) {
+    await sendVideo(info.pageUrl);
+  }
 });
+
+// Vídeo pedido explícitamente por el usuario. Nunca se analiza una página sin que lo pida.
+async function sendVideo(page) {
+  if (!self.W11DL.isWebUrl(page)) {
+    notify("No se puede descargar", "La dirección no es web.");
+    return;
+  }
+  try {
+    await handoffVideo(page);
+    notify("Vídeo en cola", "El acelerador lo descarga cuando la resolución termine.");
+  } catch (err) {
+    setBadge("!");
+    notify("No se pudo descargar el vídeo", err.message);
+  }
+}
 
 async function sendOne(url, pageUrl) {
   if (!self.W11DL.isWebUrl(url)) return { url, ok: false, error: "URL no web" };
@@ -188,6 +221,16 @@ browser.runtime.onInstalled.addListener(() => {
     id: "w11dl-link",
     title: "Descargar con W11DownloaderPro",
     contexts: ["link"],
+  });
+  browser.contextMenus.create({
+    id: "w11dl-video-link",
+    title: "Descargar vídeo de este enlace con W11DownloaderPro",
+    contexts: ["link"],
+  });
+  browser.contextMenus.create({
+    id: "w11dl-video-page",
+    title: "Descargar vídeo de esta página con W11DownloaderPro",
+    contexts: ["page"],
   });
 });
 

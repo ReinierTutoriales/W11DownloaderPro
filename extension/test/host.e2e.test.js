@@ -134,3 +134,47 @@ test("una cabecera fuera de la lista blanca se rechaza antes de descargar", asyn
     fs.rmSync(outDir, { recursive: true, force: true });
   }
 });
+
+test("vídeo de página: el host resuelve con yt-dlp, acusa y descarga", async (t) => {
+  if (!fs.existsSync(HOST_BIN)) {
+    t.skip(`host no compilado: ${HOST_BIN}`);
+    return;
+  }
+  if (!process.env.W11DL_PYTHON) {
+    t.skip("define W11DL_PYTHON con un Python que tenga yt-dlp");
+    return;
+  }
+  const data = Buffer.from(Array.from({ length: 250_000 }, (_, i) => (i * 11) & 0xff));
+  const page = `<!doctype html><html><head><title>Prueba</title></head><body><video src="/clip.mp4"></video></body></html>`;
+  const server = http.createServer((req, res) => {
+    if (req.url === "/clip.mp4") {
+      res.writeHead(200, { "Content-Type": "video/mp4", "Content-Length": data.length });
+      res.end(data);
+    } else {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(page);
+    }
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "w11dl-video-"));
+  const client = connect(outDir);
+  try {
+    client.send(core.enqueueVideoMessage({ id: "vid", page: `http://127.0.0.1:${server.address().port}/` }));
+    assert.equal((await client.next()).type, "probing");
+    const accepted = await client.next();
+    assert.equal(accepted.type, "accepted", JSON.stringify(accepted));
+    let done;
+    for (;;) {
+      const msg = await client.next();
+      if (msg.type === "progress") continue;
+      done = msg;
+      break;
+    }
+    assert.equal(done.type, "done", JSON.stringify(done));
+    assert.deepEqual(fs.readFileSync(path.join(outDir, path.basename(accepted.path))), data);
+  } finally {
+    server.close();
+    await client.close();
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
+});

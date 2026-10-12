@@ -18,6 +18,7 @@ La extensión queda activa hasta cerrar Firefox. Para una instalación permanent
 - **Captura automática**: cuando una navegación devuelve un archivo adjunto (`Content-Disposition: attachment`) o un tipo binario que Firefox descarga (zip, exe, iso, 7z, rar, tar, gz, octet-stream), la respuesta se cancela y la URL se envía al host con las cookies de la sesión y el referente. El host la descarga.
 - **Respaldo**: si el host no acepta en 10 segundos, la misma URL se vuelve a pedir al navegador. Nunca se pierde una descarga.
 - **Menú contextual**: clic derecho sobre un enlace → *Descargar con W11DownloaderPro*.
+- **Vídeo**: clic derecho sobre la página o un enlace → *Descargar vídeo de…*. El host lo resuelve con yt-dlp (sin DRM, sin HLS/DASH en esta fase) y lo descarga. Solo se hace si lo pides; las páginas no se analizan en segundo plano. Requiere Python con `yt-dlp==2026.08.19` (variable `W11DL_PYTHON` o `python` en el PATH).
 - **Buscar archivos en la página**: botón del popup. Lista los enlaces de archivo de la pestaña activa y envía los seleccionados.
 - **Interruptor** en el popup para desactivar la captura automática.
 
@@ -38,7 +39,7 @@ No se envía nada a servidores de terceros. Todo el tráfico va del navegador al
 ## Pruebas
 
 ```
-npm test                 # lógica y protocolo (Node 22+, no necesita Firefox)
+npm test                 # lógica, protocolo y vídeo (Node 22+; vídeo requiere W11DL_PYTHON)
 FIREFOX_BIN=ruta/firefox npm run test:firefox   # extremo a extremo en Firefox real
 ```
 
