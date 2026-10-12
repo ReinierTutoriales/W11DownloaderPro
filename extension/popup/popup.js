@@ -49,6 +49,38 @@ $("scan").addEventListener("click", async () => {
 
 init();
 
+// ---- Límite de velocidad ----
+
+async function initLimit() {
+  const select = $("limit");
+  for (const choice of W11DL.LIMIT_CHOICES) {
+    const option = document.createElement("option");
+    option.value = String(choice.value);
+    option.textContent = choice.label;
+    select.append(option);
+  }
+  const { bytesPerSec, error } = await browser.runtime.sendMessage({ type: "get-limit" });
+  if (error) {
+    select.disabled = true;
+    return;
+  }
+  // Un valor fijado fuera del selector (p. ej. desde la línea de órdenes) se muestra tal cual.
+  if (!W11DL.LIMIT_CHOICES.some((c) => c.value === bytesPerSec)) {
+    const option = document.createElement("option");
+    option.value = String(bytesPerSec);
+    option.textContent = `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+    select.append(option);
+  }
+  select.value = String(bytesPerSec);
+}
+
+$("limit").addEventListener("change", async (e) => {
+  const result = await browser.runtime.sendMessage({ type: "set-limit", bytesPerSec: Number(e.target.value) });
+  status(result.error ? `No se pudo fijar el límite: ${result.error}` : "Límite aplicado.");
+});
+
+initLimit();
+
 // ---- Cola de descargas ----
 
 const LABELS = {

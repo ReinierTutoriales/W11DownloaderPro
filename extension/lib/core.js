@@ -151,6 +151,22 @@
     }
   }
 
+  // Opciones del selector de límite de velocidad (bytes/s; 0 = sin límite).
+  const LIMIT_CHOICES = [
+    { label: "Sin límite", value: 0 },
+    { label: "256 KB/s", value: 256 * 1024 },
+    { label: "1 MB/s", value: 1024 * 1024 },
+    { label: "5 MB/s", value: 5 * 1024 * 1024 },
+    { label: "20 MB/s", value: 20 * 1024 * 1024 },
+  ];
+
+  // Mensaje al host para fijar el límite; sin valor solo lo consulta. Rechaza lo que no sea un entero >= 0.
+  function limitMessage(bytesPerSec) {
+    if (bytesPerSec === undefined) return { type: "set_limit" };
+    if (!Number.isSafeInteger(bytesPerSec) || bytesPerSec < 0) return null;
+    return { type: "set_limit", bytes_per_sec: bytesPerSec };
+  }
+
   function enqueueVideoMessage({ id, page }) {
     return { type: "enqueue_video", id, page };
   }
@@ -172,6 +188,8 @@
     enqueueMessage,
     enqueueVideoMessage,
     queueActions,
+    LIMIT_CHOICES,
+    limitMessage,
   };
 
   if (typeof module !== "undefined" && module.exports) {

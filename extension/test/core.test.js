@@ -92,3 +92,11 @@ test("acciones de la cola según el estado", () => {
   assert.deepEqual(core.queueActions("done"), []);
   assert.deepEqual(core.queueActions("canceled"), []);
 });
+
+test("mensaje de límite: consulta, valor válido y valores inválidos", () => {
+  assert.deepEqual(core.limitMessage(), { type: "set_limit" });
+  assert.deepEqual(core.limitMessage(0), { type: "set_limit", bytes_per_sec: 0 });
+  assert.deepEqual(core.limitMessage(1048576), { type: "set_limit", bytes_per_sec: 1048576 });
+  for (const bad of [-1, 1.5, NaN, Infinity, "5", null]) assert.equal(core.limitMessage(bad), null);
+  assert.equal(core.LIMIT_CHOICES[0].value, 0);
+});

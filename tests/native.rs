@@ -164,3 +164,81 @@ async fn enqueue_video_rechaza_urls_no_web() {
     ext_write.shutdown().await.unwrap();
     host.await.unwrap().unwrap();
 }
+
+/// Arranca un host sobre `dir` y devuelve sus extremos.
+fn start_host(
+    dir: &std::path::Path,
+) -> (
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let (host_side, ext_side) = duplex(1 << 20);
+    let (host_read, host_write) = split(host_side);
+    let (ext_read, ext_write) = split(ext_side);
+    let out = dir.to_path_buf();
+    let host = tokio::spawn(async move { serve_host(host_read, host_write, out).await });
+    (ext_read, ext_write, host)
+}
+
+#[tokio::test]
+async fn limite_de_velocidad_se_aplica_se_recuerda_y_se_consulta() {
+    let data = payload(3 << 20);
+    let (addr, _site) = serve(vec![("/g.bin", "application/octet-stream", data.clone())]).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let (mut read, mut write, host) = start_host(dir.path());
+    // Consultar sin valor no cambia nada: por defecto no hay límite.
+    write_message(&mut write, &json!({"type": "set_limit"}))
+        .await
+        .unwrap();
+    assert_eq!(next_limit(&mut read).await, 0);
+
+    write_message(
+        &mut write,
+        &json!({"type": "set_limit", "bytes_per_sec": 1 << 20}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_limit(&mut read).await, 1 << 20);
+
+    let started = std::time::Instant::now();
+    write_message(
+        &mut write,
+        &json!({"type": "enqueue", "id": "g", "url": format!("http://{addr}/g.bin"), "filename": "g.bin"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_for(&mut read, "g").await["type"], "accepted");
+    assert_eq!(next_for(&mut read, "g").await["type"], "done");
+    let took = started.elapsed();
+    eprintln!("[host limite] 3 MiB a 1 MiB/s en {took:?}");
+    assert_eq!(std::fs::read(dir.path().join("g.bin")).unwrap(), data);
+    assert!(took.as_secs_f64() > 2.2, "no respetó el límite: {took:?}");
+    assert!(
+        took.as_secs_f64() < 5.0,
+        "muy por debajo del límite: {took:?}"
+    );
+
+    write.shutdown().await.unwrap();
+    host.await.unwrap().unwrap();
+
+    // Un host nuevo recuerda el límite.
+    let (mut read, mut write, host) = start_host(dir.path());
+    write_message(&mut write, &json!({"type": "set_limit"}))
+        .await
+        .unwrap();
+    assert_eq!(next_limit(&mut read).await, 1 << 20);
+    write.shutdown().await.unwrap();
+    host.await.unwrap().unwrap();
+}
+
+async fn next_limit(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> u64 {
+    loop {
+        let raw = read_message(reader).await.unwrap().expect("host cerrado");
+        let msg: Value = serde_json::from_slice(&raw).unwrap();
+        if msg["type"] == "limit" {
+            return msg["bytes_per_sec"].as_u64().unwrap();
+        }
+    }
+}

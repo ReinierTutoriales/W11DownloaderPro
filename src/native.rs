@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, mpsc};
 use url::Url;
 
 use crate::engine::{self, Control, Options, Outcome};
+use crate::limits::RateLimiter;
 use crate::naming;
 use crate::proxy::ProxyMode;
 use crate::queue::{Record, Registry, State};
@@ -59,6 +60,11 @@ pub enum Incoming {
     },
     /// Devuelve la cola completa.
     List,
+    /// Fija el límite de velocidad total en bytes/s (0 = sin límite) y lo recuerda. Sin valor,
+    /// solo consulta el actual. Se aplica en caliente a las descargas en curso.
+    SetLimit {
+        bytes_per_sec: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -95,6 +101,10 @@ pub enum Outgoing {
     },
     Queue {
         items: Vec<Record>,
+    },
+    /// Límite de velocidad vigente en bytes/s (0 = sin límite).
+    Limit {
+        bytes_per_sec: u64,
     },
 }
 
@@ -145,6 +155,7 @@ where
     });
 
     let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let limiter = RateLimiter::new(settings::load_limit(&out_dir));
     let mut jobs = tokio::task::JoinSet::new();
     let registry = Registry::load(&out_dir);
     if let Err(e) = registry.save(&out_dir) {
@@ -169,9 +180,10 @@ where
                 let tx = tx.clone();
                 let out_dir = out_dir.clone();
                 let registry = registry.clone();
+                let limiter = Arc::clone(&limiter);
                 jobs.spawn(async move {
                     let _permit = slots.acquire_owned().await.expect("semáforo abierto");
-                    run_video(id, page, out_dir, registry, tx).await;
+                    run_video(id, page, out_dir, registry, tx, limiter).await;
                 });
             }
             Ok(Incoming::Enqueue {
@@ -200,9 +212,10 @@ where
                     let tx = tx.clone();
                     let registry = registry.clone();
                     let out_dir = out_dir.clone();
+                    let limiter = Arc::clone(&limiter);
                     jobs.spawn(async move {
                         let _permit = slots.acquire_owned().await.expect("semáforo abierto");
-                        run(job, tx, registry, out_dir).await;
+                        run(job, tx, registry, out_dir, limiter).await;
                     });
                 }
                 Err(message) => {
@@ -261,9 +274,10 @@ where
                     let tx = tx.clone();
                     let registry = registry.clone();
                     let out_dir = out_dir.clone();
+                    let limiter = Arc::clone(&limiter);
                     jobs.spawn(async move {
                         let _permit = slots.acquire_owned().await.expect("semáforo abierto");
-                        run(job, tx, registry, out_dir).await;
+                        run(job, tx, registry, out_dir, limiter).await;
                     });
                 }
                 _ => {
@@ -273,6 +287,17 @@ where
                     });
                 }
             },
+            Ok(Incoming::SetLimit { bytes_per_sec }) => {
+                if let Some(rate) = bytes_per_sec {
+                    limiter.set_rate(rate);
+                    if let Err(e) = settings::save_limit(&out_dir, rate) {
+                        eprintln!("w11dl-host: no se pudo guardar el límite: {e}");
+                    }
+                }
+                let _ = tx.send(Outgoing::Limit {
+                    bytes_per_sec: limiter.rate(),
+                });
+            }
             Ok(Incoming::List) => {
                 let _ = tx.send(Outgoing::Queue {
                     items: registry.records(),
@@ -351,6 +376,7 @@ async fn run_video(
     out_dir: PathBuf,
     registry: Registry,
     tx: mpsc::UnboundedSender<Outgoing>,
+    limiter: Arc<RateLimiter>,
 ) {
     let opts = crate::video::ProbeOptions {
         python: crate::video::default_python(),
@@ -404,11 +430,17 @@ async fn run_video(
         headers,
         control,
     };
-    run(job, tx, registry, out_dir).await;
+    run(job, tx, registry, out_dir, limiter).await;
 }
 
 /// Ejecuta una descarga controlada y deja su resultado en la cola (y en disco).
-async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>, registry: Registry, out_dir: PathBuf) {
+async fn run(
+    job: Job,
+    tx: mpsc::UnboundedSender<Outgoing>,
+    registry: Registry,
+    out_dir: PathBuf,
+    limiter: Arc<RateLimiter>,
+) {
     let progress = Arc::new(AtomicU64::new(0));
     let reporter = {
         let progress = Arc::clone(&progress);
@@ -431,6 +463,7 @@ async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>, registry: Registry, 
     opts.headers = job.headers;
     opts.proxy = ProxyMode::System;
     opts.progress = Some(Arc::clone(&progress));
+    opts.limiter = Some(limiter);
 
     let result = engine::download_controlled(opts, job.control).await;
     reporter.abort();
@@ -478,6 +511,31 @@ async fn run(job: Job, tx: mpsc::UnboundedSender<Outgoing>, registry: Registry, 
         eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
     }
     let _ = tx.send(message);
+}
+
+/// Ajustes persistentes del host (solo el límite de velocidad; nada de sesión).
+mod settings {
+    use std::path::Path;
+
+    const FILE: &str = ".w11dl-settings.json";
+
+    pub fn load_limit(dir: &Path) -> u64 {
+        std::fs::read_to_string(dir.join(FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("limit_bytes_per_sec")?.as_u64())
+            .unwrap_or(0)
+    }
+
+    pub fn save_limit(dir: &Path, rate: u64) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!("{FILE}.tmp"));
+        std::fs::write(
+            &tmp,
+            serde_json::json!({ "limit_bytes_per_sec": rate }).to_string(),
+        )?;
+        std::fs::rename(&tmp, dir.join(FILE))
+    }
 }
 
 /// Borra el parcial y su estado de reanudación de una descarga cancelada.

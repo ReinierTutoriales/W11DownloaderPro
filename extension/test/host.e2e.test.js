@@ -178,3 +178,25 @@ test("vídeo de página: el host resuelve con yt-dlp, acusa y descarga", async (
     fs.rmSync(outDir, { recursive: true, force: true });
   }
 });
+
+test("el host real fija, recuerda y devuelve el límite con los mensajes de la extensión", async (t) => {
+  if (!fs.existsSync(HOST_BIN)) {
+    t.skip(`host no compilado: ${HOST_BIN} (ejecuta cargo build)`);
+    return;
+  }
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "w11dl-limit-"));
+  let client = connect(outDir);
+  try {
+    client.send(core.limitMessage());
+    assert.deepEqual(await client.next(), { type: "limit", bytes_per_sec: 0 });
+    client.send(core.limitMessage(1048576));
+    assert.deepEqual(await client.next(), { type: "limit", bytes_per_sec: 1048576 });
+    await client.close();
+
+    client = connect(outDir);
+    client.send(core.limitMessage());
+    assert.deepEqual(await client.next(), { type: "limit", bytes_per_sec: 1048576 });
+  } finally {
+    await client.close();
+  }
+});

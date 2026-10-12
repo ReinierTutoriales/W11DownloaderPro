@@ -38,6 +38,8 @@ function ensurePort() {
 
 // Respuesta pendiente de `list` (la cola completa llega como un único mensaje `queue`).
 let queueWaiter = null;
+// Respuesta pendiente de `set_limit`.
+let limitWaiter = null;
 
 function onHostMessage(msg) {
   if (!msg || typeof msg !== "object") return;
@@ -46,6 +48,13 @@ function onHostMessage(msg) {
       if (queueWaiter) {
         queueWaiter(msg.items || []);
         queueWaiter = null;
+      }
+      break;
+    }
+    case "limit": {
+      if (limitWaiter) {
+        limitWaiter(msg.bytes_per_sec || 0);
+        limitWaiter = null;
       }
       break;
     }
@@ -272,6 +281,30 @@ function listQueue() {
   });
 }
 
+// Fija (o consulta, sin valor) el límite de velocidad del host y devuelve el vigente en bytes/s.
+function requestLimit(bytesPerSec) {
+  const message = W11DL.limitMessage(bytesPerSec);
+  if (!message) return Promise.reject(new Error("límite no válido"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      limitWaiter = null;
+      reject(new Error("el host no respondió"));
+    }, 5000);
+    limitWaiter = (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
+    try {
+      ensurePort().postMessage(message);
+    } catch (err) {
+      clearTimeout(timer);
+      limitWaiter = null;
+      port = null;
+      reject(err);
+    }
+  });
+}
+
 // Acciones de la cola: pause, resume o cancel. Sus resultados llegan como eventos del host.
 function queueAction(action, id) {
   if (!["pause", "resume", "cancel"].includes(action)) {
@@ -296,6 +329,13 @@ browser.runtime.onMessage.addListener(async (msg) => {
       }
     case "queue-action":
       return queueAction(msg.action, String(msg.id || ""));
+    case "get-limit":
+    case "set-limit":
+      try {
+        return { bytesPerSec: await requestLimit(msg.type === "set-limit" ? msg.bytesPerSec : undefined) };
+      } catch (err) {
+        return { error: err.message };
+      }
     case "get-enabled":
       return { enabled: await getEnabled() };
     case "set-enabled":
