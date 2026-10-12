@@ -1,0 +1,14 @@
+{
+  "name": "w11downloaderpro-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Extensión de Firefox de W11DownloaderPro",
+  "license": "UNLICENSED",
+  "scripts": {
+    "test": "node --test test/core.test.js test/host.e2e.test.js",
+    "test:firefox": "node test/firefox-e2e.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

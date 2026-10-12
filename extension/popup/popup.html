@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>W11DownloaderPro</title>
+    <style>
+      body { font: 13px system-ui, sans-serif; width: 360px; margin: 0; padding: 12px; }
+      label { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+      button { margin: 6px 0; padding: 4px 10px; }
+      #links { max-height: 240px; overflow: auto; border: 1px solid #8884; padding: 4px; }
+      #links label { margin: 2px 0; word-break: break-all; }
+      #status { margin-top: 8px; color: #666; min-height: 1em; }
+    </style>
+  </head>
+  <body>
+    <label><input type="checkbox" id="enabled" /> Capturar descargas del navegador</label>
+    <button id="scan">Buscar archivos en esta página</button>
+    <div id="links"></div>
+    <button id="send" hidden>Enviar seleccionados</button>
+    <div id="status" role="status"></div>
+    <script src="../lib/core.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

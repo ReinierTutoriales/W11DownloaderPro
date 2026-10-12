@@ -2,7 +2,7 @@
 //!
 //! Uso:
 //! - Sin argumentos: modo servicio (lo ejecuta el navegador).
-//! - `register --extension-id <id>`: escribe el manifiesto y lo registra para Chrome y Edge.
+//! - `register [--extension-id <id>] [--firefox-id <id>]`: escribe los manifiestos y los registra.
 //! - `unregister`: quita el registro.
 
 use std::path::PathBuf;
@@ -33,15 +33,14 @@ async fn main() -> ExitCode {
 }
 
 fn run_register(args: &[String]) -> std::io::Result<String> {
-    let id = value_of(args, "--extension-id").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "falta --extension-id <id>",
-        )
-    })?;
+    let targets = register::Targets {
+        chromium_id: value_of(args, "--extension-id"),
+        firefox_id: value_of(args, "--firefox-id"),
+    };
     let host_exe = std::env::current_exe()?;
-    let path = register::register(&host_exe, &id, &manifest_dir())?;
-    Ok(format!("Registrado: {}", path.display()))
+    let written = register::register(&host_exe, &targets, &manifest_dir())?;
+    let list: Vec<String> = written.iter().map(|p| p.display().to_string()).collect();
+    Ok(format!("Registrado: {}", list.join(", ")))
 }
 
 fn finish(result: std::io::Result<String>) -> ExitCode {
