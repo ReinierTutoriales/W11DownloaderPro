@@ -1,11 +1,12 @@
 //! Orquestación de la descarga: reparto dinámico de fragmentos, reintentos,
 //! checkpoints de reanudación y publicación atómica del archivo final.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use hyper::Uri;
 use hyper::header::HeaderMap;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 
 use crate::error::{Error, Result};
@@ -32,6 +33,8 @@ const HASH_BLOCK: usize = 1 << 20;
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 /// Ventana mínima de una muestra de velocidad.
 const MIN_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
+/// Cada cuánto un trabajador sin trabajo propio revisa si algún fragmento ajeno merece una copia.
+const HEDGE_POLL: Duration = Duration::from_millis(40);
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -73,6 +76,8 @@ pub enum Mode {
         chunks: usize,
         connections: usize,
         settled: usize,
+        /// Copias lanzadas contra fragmentos lentos (el primero en llegar gana).
+        copies: usize,
     },
     /// Un solo flujo, sin reanudación. Se usa cuando el servidor no atiende rangos.
     Single,
@@ -267,6 +272,10 @@ async fn segmented(
         retire: AtomicUsize::new(0),
         retry: std::sync::Mutex::new(std::collections::VecDeque::new()),
         refusals: AtomicUsize::new(0),
+        flights: std::sync::Mutex::new(HashMap::new()),
+        typical_rate: AtomicU64::new(0),
+        hedges: AtomicUsize::new(0),
+        settled: tokio::sync::Notify::new(),
     });
 
     let mut set = JoinSet::new();
@@ -373,6 +382,7 @@ async fn segmented(
             chunks: chunk_count,
             connections: peak,
             settled: controller.conns().min(ceiling.cap()),
+            copies: shared.hedges.load(Ordering::Relaxed),
         },
     }))
 }
@@ -406,9 +416,115 @@ struct Shared {
     retry: std::sync::Mutex<std::collections::VecDeque<Chunk>>,
     /// Rechazos del servidor (403, 429 o 503) que retiraron una conexión.
     refusals: AtomicUsize,
+    /// Fragmentos que alguien está bajando ahora. Con la cola vacía, una conexión libre puede
+    /// competir contra uno que va muy lento en vez de esperar a que termine.
+    flights: std::sync::Mutex<HashMap<usize, Arc<Flight>>>,
+    /// Velocidad habitual de un fragmento completo (media móvil, bytes/s como bits de `f64`).
+    typical_rate: AtomicU64,
+    /// Copias lanzadas (diagnóstico y pruebas).
+    hedges: AtomicUsize,
+    /// Avisa a los trabajadores en espera de que un fragmento terminó (puede que ya no quede nada que copiar).
+    settled: tokio::sync::Notify,
+}
+
+/// Un fragmento en descarga, visible para quien pueda copiarlo.
+struct Flight {
+    chunk: Chunk,
+    started: Instant,
+    /// Bytes recibidos por el intento original.
+    received: AtomicU64,
+    hedged: AtomicBool,
+    /// `true` cuando algún intento ya entregó el fragmento: los demás se abandonan.
+    done: watch::Sender<bool>,
+}
+
+enum Role {
+    Primary,
+    Copy,
+}
+
+/// Qué hace un trabajador sin fragmentos nuevos que tomar.
+enum Idle {
+    /// Copiar este fragmento.
+    Copy(Arc<Flight>),
+    /// Hay fragmentos en curso que aún pueden merecer copia: esperar y volver a mirar.
+    Wait,
+    /// Nada más que hacer.
+    Done,
 }
 
 impl Shared {
+    fn begin_flight(&self, chunk: Chunk) -> Arc<Flight> {
+        let flight = Arc::new(Flight {
+            chunk,
+            started: Instant::now(),
+            received: AtomicU64::new(0),
+            hedged: AtomicBool::new(false),
+            done: watch::channel(false).0,
+        });
+        self.flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chunk.index, Arc::clone(&flight));
+        flight
+    }
+
+    fn end_flight(&self, flight: &Arc<Flight>) {
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        if flights
+            .get(&flight.chunk.index)
+            .is_some_and(|f| Arc::ptr_eq(f, flight))
+        {
+            flights.remove(&flight.chunk.index);
+        }
+        drop(flights);
+        self.settled.notify_waiters();
+    }
+
+    fn typical_rate(&self) -> f64 {
+        f64::from_bits(self.typical_rate.load(Ordering::Relaxed))
+    }
+
+    /// Media móvil de la velocidad de los fragmentos completados.
+    fn note_rate(&self, len: u64, took: Duration) {
+        let rate = len as f64 / took.as_secs_f64().max(1e-3);
+        let old = self.typical_rate();
+        let new = if old > 0.0 {
+            0.7 * old + 0.3 * rate
+        } else {
+            rate
+        };
+        self.typical_rate.store(new.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Con la cola vacía: elige un fragmento lento para copiar, espera, o termina.
+    fn next_idle(&self) -> Idle {
+        // Un servidor que ya rechaza conexiones no quiere más: no se abren copias.
+        if self.refusals.load(Ordering::Relaxed) > 0 {
+            return Idle::Done;
+        }
+        let typical = self.typical_rate();
+        let flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        let mut open = false;
+        for flight in flights.values() {
+            if flight.hedged.load(Ordering::Relaxed) || *flight.done.borrow() {
+                continue;
+            }
+            open = true;
+            let worthwhile = plan::hedge_worthwhile(
+                flight.chunk.len(),
+                flight.received.load(Ordering::Relaxed),
+                flight.started.elapsed().as_millis() as u64,
+                typical,
+            );
+            if worthwhile && !flight.hedged.swap(true, Ordering::Relaxed) {
+                self.hedges.fetch_add(1, Ordering::Relaxed);
+                return Idle::Copy(Arc::clone(flight));
+            }
+        }
+        if open { Idle::Wait } else { Idle::Done }
+    }
+
     /// Siguiente fragmento: primero los devueltos, después los nuevos por orden.
     fn take_chunk(&self) -> Option<Chunk> {
         let returned = self
@@ -522,15 +638,35 @@ async fn run_worker(shared: Arc<Shared>) -> Result<()> {
         {
             return Ok(());
         }
-        let Some(chunk) = shared.take_chunk() else {
-            return Ok(());
+        let (chunk, flight, role) = match shared.take_chunk() {
+            Some(chunk) => (chunk, shared.begin_flight(chunk), Role::Primary),
+            None => match shared.next_idle() {
+                Idle::Copy(flight) => (flight.chunk, flight, Role::Copy),
+                Idle::Wait => {
+                    // Se despierta antes si un fragmento termina: puede que ya no quede nada que copiar.
+                    let _ = tokio::time::timeout(HEDGE_POLL, shared.settled.notified()).await;
+                    continue;
+                }
+                Idle::Done => return Ok(()),
+            },
         };
 
-        let data = match fetch_with_retry(&shared, chunk).await? {
-            Fetched::Data(data) => data,
-            Fetched::Refused => {
+        // El intento compite con los demás por el mismo fragmento: si otro lo entrega antes, este se abandona.
+        let mut lost = flight.done.subscribe();
+        let began = Instant::now();
+        let fetched = tokio::select! {
+            r = fetch_with_retry(&shared, chunk, &flight.received) => Some(r),
+            _ = lost.wait_for(|done| *done) => None,
+        };
+        let data = match (fetched, &role) {
+            (None, _) => continue,
+            (Some(Ok(Fetched::Data(data))), _) => data,
+            // Una copia es trabajo opcional: si falla o se rechaza, se descarta sin más.
+            (Some(_), Role::Copy) => continue,
+            (Some(Ok(Fetched::Refused)), Role::Primary) => {
                 // El servidor rechazó esta conexión mientras sirve otras: el fragmento vuelve a la cola
                 // para que lo tome una conexión libre, y esta se retira.
+                shared.end_flight(&flight);
                 shared
                     .retry
                     .lock()
@@ -539,18 +675,36 @@ async fn run_worker(shared: Arc<Shared>) -> Result<()> {
                 shared.refusals.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
+            (Some(Err(e)), Role::Primary) => {
+                shared.end_flight(&flight);
+                return Err(e);
+            }
         };
+        shared.note_rate(chunk.len(), began.elapsed());
+
+        // Otro intento pudo entregarlo mientras llegaba el último bloque.
+        if *flight.done.borrow() {
+            continue;
+        }
         let file = Arc::clone(&shared.file);
         let offset = chunk.start;
         tokio::task::spawn_blocking(move || write_at(&file, &data, offset))
             .await
             .map_err(io::Error::other)??;
 
+        // Solo el primero en marcarlo cuenta el progreso; escribir dos veces los mismos bytes es inocuo.
+        let first = {
+            let mut state = shared.state.lock().await;
+            !std::mem::replace(&mut state.done[chunk.index], true)
+        };
+        flight.done.send_replace(true);
+        shared.end_flight(&flight);
+        if !first {
+            continue;
+        }
         if let Some(p) = &shared.progress {
             p.fetch_add(chunk.len(), Ordering::Relaxed);
         }
-
-        shared.state.lock().await.done[chunk.index] = true;
         if shared.unflushed.fetch_add(1, Ordering::Relaxed) + 1 >= FLUSH_EVERY {
             shared.unflushed.store(0, Ordering::Relaxed);
             checkpoint(&shared).await?;
@@ -558,7 +712,11 @@ async fn run_worker(shared: Arc<Shared>) -> Result<()> {
     }
 }
 
-async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Fetched> {
+async fn fetch_with_retry(
+    shared: &Shared,
+    chunk: Chunk,
+    flight_bytes: &AtomicU64,
+) -> Result<Fetched> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -568,7 +726,7 @@ async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Fetched> {
             chunk,
             shared.if_range.as_deref(),
             &shared.headers,
-            &shared.rx_bytes,
+            &[&shared.rx_bytes, flight_bytes],
         )
         .await
         {

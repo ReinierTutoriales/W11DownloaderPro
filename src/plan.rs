@@ -286,6 +286,31 @@ pub fn plan(total: u64, chunk_size: u64) -> Vec<Chunk> {
     chunks
 }
 
+/// Edad mínima de un fragmento en curso antes de plantearse una copia: antes, su velocidad aún no dice nada.
+pub const HEDGE_MIN_AGE_MS: u64 = 250;
+/// Coste de abrir una petición nueva antes del primer byte, que se suma al tiempo de una copia.
+const HEDGE_STARTUP_SECS: f64 = 0.05;
+
+/// ¿Compensa lanzar una copia de un fragmento que otra conexión sigue bajando?
+///
+/// Solo si la copia, que empieza de cero a la velocidad habitual, terminaría en menos de la mitad
+/// del tiempo que le queda al original a su ritmo actual. Así el trabajo duplicado solo se paga
+/// cuando casi seguro gana, y un fragmento que avanza bien nunca se duplica.
+pub fn hedge_worthwhile(len: u64, received: u64, age_ms: u64, typical_rate: f64) -> bool {
+    if age_ms < HEDGE_MIN_AGE_MS || typical_rate <= 0.0 || received >= len {
+        return false;
+    }
+    let rate = received as f64 / (age_ms as f64 / 1000.0);
+    let remaining = (len - received) as f64;
+    let eta_original = if rate > 0.0 {
+        remaining / rate
+    } else {
+        f64::INFINITY
+    };
+    let eta_copy = HEDGE_STARTUP_SECS + len as f64 / typical_rate;
+    eta_original >= 2.0 * eta_copy
+}
+
 /// Validadores del recurso remoto: lo que permite saber si sigue siendo el mismo archivo.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Validators {
@@ -682,6 +707,33 @@ mod tests {
         assert_eq!(v(Some("W/\"a\""), Some("Mon")).if_range(), Some("Mon"));
         assert_eq!(v(Some("W/\"a\""), None).if_range(), None);
         assert_eq!(v(None, Some("Mon")).if_range(), Some("Mon"));
+    }
+
+    #[test]
+    fn copia_solo_si_casi_seguro_gana() {
+        let mib = 1 << 20;
+        // Fragmento de 1 MiB con 100 KiB tras 1 s (~100 KiB/s) y velocidad habitual de 5 MiB/s: copiar.
+        assert!(hedge_worthwhile(mib, 100 * 1024, 1000, 5.0 * mib as f64));
+        // Fragmento de 4 MiB que avanza a la velocidad habitual: no se duplica.
+        assert!(!hedge_worthwhile(
+            4 * mib,
+            5 * mib / 2,
+            500,
+            5.0 * mib as f64
+        ));
+        // Uno que va a la mitad de la habitual tampoco: la copia no ganaría por el doble.
+        assert!(!hedge_worthwhile(
+            4 * mib,
+            5 * mib / 4,
+            500,
+            5.0 * mib as f64
+        ));
+        // Demasiado joven para medir, sin referencia de velocidad, o ya completo.
+        assert!(!hedge_worthwhile(mib, 0, 100, 5.0 * mib as f64));
+        assert!(!hedge_worthwhile(mib, 0, 5000, 0.0));
+        assert!(!hedge_worthwhile(mib, mib, 5000, 5.0 * mib as f64));
+        // Sin recibir nada pasado el mínimo: velocidad desconocida, tiempo infinito, se copia.
+        assert!(hedge_worthwhile(mib, 0, 1000, 5.0 * mib as f64));
     }
 
     #[test]

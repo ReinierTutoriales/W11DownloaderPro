@@ -141,7 +141,7 @@ pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<
 /// Descarga un fragmento completo. Usa `If-Range` cuando hay validador, para que el servidor
 /// responda con datos inconsistentes (200 completo) en lugar de mezclar versiones del archivo.
 ///
-/// Cada bloque recibido se suma a `received` al llegar (no al terminar el fragmento): así la
+/// Cada bloque recibido se suma a todos los contadores de `received` al llegar (no al terminar el fragmento): así la
 /// velocidad medida es continua y las conexiones nuevas aportan desde el primer byte.
 pub async fn fetch_chunk(
     client: &HttpClient,
@@ -149,7 +149,7 @@ pub async fn fetch_chunk(
     chunk: Chunk,
     etag: Option<&str>,
     extra: &HeaderMap,
-    received: &std::sync::atomic::AtomicU64,
+    received: &[&std::sync::atomic::AtomicU64],
 ) -> Result<Bytes> {
     let mut builder = Request::builder()
         .method(Method::GET)
@@ -177,7 +177,9 @@ pub async fn fetch_chunk(
     while let Some(frame) = body.frame().await {
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
-            received.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            for counter in received {
+                counter.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             buf.extend_from_slice(&data);
             // Un servidor que envía de más no debe llenar la memoria.
             if buf.len() as u64 > expected {
