@@ -179,7 +179,7 @@ pub async fn download(
             status = child.wait() => break Some(status),
             _ = tokio::time::sleep(POLL) => {
                 if control.is_paused() || control.is_canceled() {
-                    let _ = child.kill().await;
+                    kill_tree(&mut child).await;
                     break None;
                 }
             }
@@ -191,7 +191,7 @@ pub async fn download(
 
     let Some(status) = status else {
         if control.is_canceled() {
-            let _ = tokio::fs::remove_dir_all(&job.temp_dir).await;
+            remove_dir_retrying(&job.temp_dir).await;
             return Ok((Outcome::Canceled, None));
         }
         return Ok((Outcome::Paused { bytes: bytes_seen }, None));
@@ -218,7 +218,7 @@ pub async fn download(
         .filter(|p| p.starts_with(&job.out_dir) && p.is_file())
         .ok_or_else(|| Error::Video("yt-dlp terminó sin producir un archivo".into()))?;
     let bytes = tokio::fs::metadata(&path).await?.len();
-    let _ = tokio::fs::remove_dir_all(&job.temp_dir).await;
+    remove_dir_retrying(&job.temp_dir).await;
     if let Some(p) = &progress {
         p.store(bytes, Ordering::Relaxed);
     }
@@ -232,6 +232,34 @@ pub async fn download(
         }),
         Some(path),
     ))
+}
+
+/// Mata a yt-dlp y a todo lo que lanzó. El `yt-dlp.exe` oficial es un arrancador que ejecuta el
+/// programa real como proceso hijo: matar solo al arrancador deja al hijo escribiendo en la carpeta
+/// de intermedios, y al reanudar habría dos procesos sobre los mismos archivos.
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
+}
+
+/// Borra una carpeta aunque algún archivo siga bloqueado un instante tras matar el proceso.
+async fn remove_dir_retrying(dir: &Path) {
+    for _ in 0..30 {
+        match tokio::fs::remove_dir_all(dir).await {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 /// Carpeta de intermedios de una descarga: estable para poder retomarla, sin caracteres raros.

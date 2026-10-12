@@ -166,7 +166,12 @@ async fn cancelar_borra_los_intermedios_y_pausar_permite_retomar() {
     match outcome {
         Outcome::Canceled => {
             assert!(path.is_none() && !job.temp_dir.exists());
-            assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 0);
+            let left: Vec<_> = std::fs::read_dir(out_dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert!(left.is_empty(), "restos tras cancelar: {left:?}");
         }
         Outcome::Completed(_) => assert!(path.unwrap().is_file()),
         other => panic!("{other:?}"),
