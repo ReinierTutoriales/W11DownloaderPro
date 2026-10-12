@@ -163,8 +163,8 @@ async fn cancelar_no_deja_archivos_y_un_fallo_de_union_conserva_las_pistas() {
     cancel.cancel();
     let out2 = dir.path().join("cancelado.mp4");
     let (addr3, _s) = serve(vec![
-        ("/v.mp4", "video/mp4", vec![1u8; 300_000]),
-        ("/a.m4a", "audio/mp4", vec![2u8; 300_000]),
+        ("/v.mp4", "video/mp4", payload(300_000)),
+        ("/a.m4a", "audio/mp4", payload(300_000)),
     ])
     .await;
     let outcome = download_merged(Options::new("x", &out2), job(addr3), cancel)
