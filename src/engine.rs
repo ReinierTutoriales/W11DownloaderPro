@@ -30,8 +30,6 @@ const FLUSH_EVERY: usize = 16;
 const HASH_BLOCK: usize = 1 << 20;
 /// Periodo de muestreo para decidir cuántas conexiones usar.
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
-/// Muestras sin mejora seguidas antes de dejar de añadir conexiones.
-const FLAT_SAMPLES_TO_STOP: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -178,19 +176,18 @@ async fn segmented(
         progress: opts.progress.clone(),
         max_attempts: opts.max_attempts.max(1),
         done_bytes: AtomicU64::new(0),
+        limit: AtomicUsize::new(0),
     });
 
     let mut set = JoinSet::new();
-    let mut active = plan::START_CONNECTIONS.min(max_workers);
-    let mut peak = active;
-    for _ in 0..active {
-        spawn_worker(&mut set, &shared);
-    }
+    let mut controller = plan::Controller::new(max_workers);
+    let mut spawned = 0usize;
+    let mut peak = controller.conns();
+    shared.limit.store(controller.conns(), Ordering::Relaxed);
+    spawn_up_to(&mut set, &shared, &mut spawned, controller.conns());
 
-    // Crecimiento adaptativo: cada muestra compara la velocidad total con la anterior.
+    // Ajuste adaptativo: cada muestra de velocidad total decide el número de conexiones.
     let mut sampler = Sampler::new();
-    let mut ramping = active < max_workers;
-    let mut flat_samples = 0u32;
     let mut tick = tokio::time::interval(SAMPLE_EVERY);
     tick.tick().await;
     loop {
@@ -209,28 +206,14 @@ async fn segmented(
                     }
                 }
             }
-            _ = tick.tick(), if ramping => {
+            _ = tick.tick(), if !controller.settled() => {
                 let Some(rate) = sampler.sample(shared.done_bytes.load(Ordering::Relaxed)) else {
                     continue;
                 };
-                let next = plan::next_connections(active, max_workers, sampler.prev_rate(), rate);
-                sampler.commit(rate);
-                if next > active {
-                    for _ in active..next {
-                        spawn_worker(&mut set, &shared);
-                    }
-                    active = next;
-                    peak = peak.max(active);
-                    flat_samples = 0;
-                } else {
-                    // Una muestra plana puede ser ruido: solo se deja de crecer tras varias seguidas.
-                    flat_samples += 1;
-                    if flat_samples >= FLAT_SAMPLES_TO_STOP {
-                        ramping = false;
-                    }
-                }
-                if active >= max_workers {
-                    ramping = false;
+                if let plan::Step::Set(n) = controller.observe(rate) {
+                    shared.limit.store(n, Ordering::Relaxed);
+                    spawn_up_to(&mut set, &shared, &mut spawned, n);
+                    peak = peak.max(n);
                 }
             }
         }
@@ -270,18 +253,29 @@ struct Shared {
     max_attempts: u32,
     /// Bytes completados en esta ejecución; alimenta la medición del crecimiento adaptativo.
     done_bytes: AtomicU64,
+    /// Número de trabajadores que deben seguir activos. Lo fija el controlador.
+    limit: AtomicUsize,
 }
 
-fn spawn_worker(set: &mut JoinSet<Result<()>>, shared: &Arc<Shared>) {
-    let shared = Arc::clone(shared);
-    set.spawn(async move { run_worker(shared).await });
+/// Lanza trabajadores hasta tener `target`. Los que quedan por encima del límite salen solos.
+fn spawn_up_to(
+    set: &mut JoinSet<Result<()>>,
+    shared: &Arc<Shared>,
+    spawned: &mut usize,
+    target: usize,
+) {
+    while *spawned < target {
+        let id = *spawned;
+        let shared = Arc::clone(shared);
+        set.spawn(async move { run_worker(shared, id).await });
+        *spawned += 1;
+    }
 }
 
 /// Velocidad total medida entre dos muestras. Ignora intervalos sin progreso.
 struct Sampler {
     last_bytes: u64,
     last_at: Instant,
-    prev_rate: f64,
 }
 
 impl Sampler {
@@ -289,7 +283,6 @@ impl Sampler {
         Self {
             last_bytes: 0,
             last_at: Instant::now(),
-            prev_rate: 0.0,
         }
     }
 
@@ -303,18 +296,14 @@ impl Sampler {
         self.last_at = Instant::now();
         Some(rate)
     }
-
-    fn prev_rate(&self) -> f64 {
-        self.prev_rate
-    }
-
-    fn commit(&mut self, rate: f64) {
-        self.prev_rate = rate;
-    }
 }
 
-async fn run_worker(shared: Arc<Shared>) -> Result<()> {
+async fn run_worker(shared: Arc<Shared>, id: usize) -> Result<()> {
     loop {
+        // Si el controlador redujo conexiones, este trabajador termina tras su fragmento actual.
+        if id >= shared.limit.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let slot = shared.cursor.fetch_add(1, Ordering::Relaxed);
         let Some(chunk) = shared.pending.get(slot).copied() else {
             return Ok(());

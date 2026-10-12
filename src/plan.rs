@@ -2,22 +2,102 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Conexiones con las que se empieza. Se añaden más solo si la velocidad total lo justifica.
-pub const START_CONNECTIONS: usize = 4;
-/// Ganancia mínima de velocidad total para justificar una conexión más (10 %).
+/// Conexiones con las que se empieza. Desde aquí el controlador duplica mientras la velocidad suba.
+pub const START_CONNECTIONS: usize = 2;
+/// Ganancia mínima de velocidad total para seguir creciendo (10 %).
 pub const RAMP_GAIN: f64 = 1.10;
+/// Caída de velocidad que indica sobrecarga (el servidor tiene tope global): se retrocede.
+pub const DROP_BELOW: f64 = 0.90;
+/// Muestras sin mejora seguidas antes de quedarse en el mejor punto.
+pub const FLAT_SAMPLES_TO_STOP: u32 = 3;
 
-/// Decide cuántas conexiones usar en la siguiente muestra. `rate` y `prev_rate` son velocidades
-/// totales en bytes/s. Si la velocidad no sube lo suficiente, el número se mantiene y el
-/// llamador deja de crecer: más conexiones solo llenan la cola del servidor.
-pub fn next_connections(current: usize, max: usize, prev_rate: f64, rate: f64) -> usize {
-    if current >= max {
-        return current;
+/// Qué hacer tras una muestra de velocidad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Mantener el número actual de conexiones.
+    Hold,
+    /// Usar exactamente este número de conexiones (puede ser mayor o menor).
+    Set(usize),
+}
+
+/// Controlador de conexiones. Busca el número de conexiones con mayor velocidad total:
+/// - Arranque exponencial: duplica mientras la velocidad suba al menos `RAMP_GAIN`.
+/// - Si la velocidad cae por debajo de `DROP_BELOW` del mejor punto, retrocede a él y para.
+/// - Si tres muestras seguidas no mejoran, se queda en el mejor punto.
+///
+/// Es una máquina de estados pura: no mide nada por sí misma, solo decide con las muestras.
+#[derive(Debug, Clone)]
+pub struct Controller {
+    max: usize,
+    conns: usize,
+    /// Mejor (conexiones, velocidad) observada hasta ahora.
+    best: Option<(usize, f64)>,
+    flat: u32,
+    settled: bool,
+}
+
+impl Controller {
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            max,
+            conns: START_CONNECTIONS.min(max),
+            best: None,
+            flat: 0,
+            settled: false,
+        }
     }
-    if prev_rate <= 0.0 || rate >= prev_rate * RAMP_GAIN {
-        current + 1
-    } else {
-        current
+
+    /// Conexiones que deben estar activas ahora.
+    pub fn conns(&self) -> usize {
+        self.conns
+    }
+
+    /// `true` cuando el controlador ya no va a cambiar el número de conexiones.
+    pub fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Procesa una muestra de velocidad total (bytes/s) medida con el número actual de conexiones.
+    pub fn observe(&mut self, rate: f64) -> Step {
+        if self.settled || rate <= 0.0 {
+            return Step::Hold;
+        }
+        let Some((best_conns, best_rate)) = self.best else {
+            self.best = Some((self.conns, rate));
+            return self.grow();
+        };
+        if rate >= best_rate * RAMP_GAIN {
+            self.best = Some((self.conns, rate));
+            self.flat = 0;
+            return self.grow();
+        }
+        if rate < best_rate * DROP_BELOW {
+            return self.settle_at(best_conns);
+        }
+        self.flat += 1;
+        if self.flat >= FLAT_SAMPLES_TO_STOP {
+            return self.settle_at(best_conns);
+        }
+        Step::Hold
+    }
+
+    fn grow(&mut self) -> Step {
+        if self.conns >= self.max {
+            self.settled = true;
+            return Step::Hold;
+        }
+        self.conns = (self.conns * 2).min(self.max);
+        Step::Set(self.conns)
+    }
+
+    fn settle_at(&mut self, conns: usize) -> Step {
+        self.settled = true;
+        if conns == self.conns {
+            return Step::Hold;
+        }
+        self.conns = conns;
+        Step::Set(conns)
     }
 }
 
@@ -129,24 +209,53 @@ mod tests {
         assert_eq!(chunks.iter().map(Chunk::len).sum::<u64>(), total);
     }
 
+    /// Simula el controlador contra una curva de velocidad en función de las conexiones.
+    fn run(curve: impl Fn(usize) -> f64, max: usize) -> (usize, usize) {
+        let mut c = Controller::new(max);
+        let mut peak = c.conns();
+        for _ in 0..30 {
+            if c.settled() {
+                break;
+            }
+            match c.observe(curve(c.conns())) {
+                Step::Set(n) => {
+                    c.conns = n;
+                    peak = peak.max(n);
+                }
+                Step::Hold => {}
+            }
+        }
+        (c.conns(), peak)
+    }
+
     #[test]
-    fn conexiones_crecen_mientras_la_velocidad_sube() {
-        assert_eq!(
-            next_connections(2, 8, 0.0, 5.0e6),
-            3,
-            "primera muestra válida: crece"
-        );
-        assert_eq!(next_connections(3, 8, 5.0e6, 6.0e6), 4, "+20 %: crece");
-        assert_eq!(
-            next_connections(4, 8, 6.0e6, 6.2e6),
-            4,
-            "+3 %: no justifica otra"
-        );
-        assert_eq!(
-            next_connections(8, 8, 1.0e6, 9.0e6),
-            8,
-            "nunca supera el máximo"
-        );
+    fn limite_por_conexion_llega_al_maximo() {
+        // 5 MB/s por conexión: cada conexión añade velocidad.
+        let (conns, _) = run(|n| n as f64 * 5.0e6, 8);
+        assert_eq!(conns, 8);
+    }
+
+    #[test]
+    fn limite_global_no_sobrecarga_y_se_queda_en_el_minimo_util() {
+        // 10 MB/s en total: a partir de 2 conexiones no hay ganancia.
+        let (conns, peak) = run(|n| (n as f64 * 5.0e6).min(10.0e6), 8);
+        assert_eq!(conns, 2, "debe retroceder al mejor punto");
+        assert!(peak <= 4, "no debe llegar a 8 conexiones: pico {peak}");
+    }
+
+    #[test]
+    fn velocidad_que_cae_hace_retroceder_al_mejor_punto() {
+        // Sube hasta 4 conexiones y luego cae por sobrecarga.
+        let curve = |n: usize| if n <= 4 { n as f64 * 5.0e6 } else { 12.0e6 };
+        let (conns, _) = run(curve, 8);
+        assert_eq!(conns, 4);
+    }
+
+    #[test]
+    fn muestras_sin_datos_no_cambian_nada() {
+        let mut c = Controller::new(8);
+        assert_eq!(c.observe(0.0), Step::Hold);
+        assert_eq!(c.conns(), START_CONNECTIONS);
     }
 
     #[test]
