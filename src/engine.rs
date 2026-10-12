@@ -30,6 +30,8 @@ const FLUSH_EVERY: usize = 16;
 const HASH_BLOCK: usize = 1 << 20;
 /// Periodo de muestreo para decidir cuántas conexiones usar.
 const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+/// Muestras sin mejora seguidas antes de dejar de añadir conexiones.
+const FLAT_SAMPLES_TO_STOP: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -188,6 +190,7 @@ async fn segmented(
     // Crecimiento adaptativo: cada muestra compara la velocidad total con la anterior.
     let mut sampler = Sampler::new();
     let mut ramping = active < max_workers;
+    let mut flat_samples = 0u32;
     let mut tick = tokio::time::interval(SAMPLE_EVERY);
     tick.tick().await;
     loop {
@@ -218,8 +221,13 @@ async fn segmented(
                     }
                     active = next;
                     peak = peak.max(active);
+                    flat_samples = 0;
                 } else {
-                    ramping = false;
+                    // Una muestra plana puede ser ruido: solo se deja de crecer tras varias seguidas.
+                    flat_samples += 1;
+                    if flat_samples >= FLAT_SAMPLES_TO_STOP {
+                        ramping = false;
+                    }
                 }
                 if active >= max_workers {
                     ramping = false;
