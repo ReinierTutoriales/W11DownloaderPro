@@ -33,6 +33,7 @@ Un cambio solo se integra si:
 1. **Solo el nombre del dueño del repositorio** (ReinierTutoriales) aparece como autor o titular en el código, la documentación, los encabezados de archivo, la licencia y los metadatos.
 2. Los commits se realizan con la identidad del dueño. No se añaden líneas `Co-Authored-By` ni firmas de terceros o de herramientas.
 3. No se usan nombres de otras personas, organizaciones o herramientas como firma de autoría.
+4. Ningún texto publicado en el repositorio (commits, descripciones de PR, comentarios, revisiones, código o documentación) lleva el nombre de un asistente o de una herramienta, ni líneas de firma automáticas. Si una plataforma añade una firma, se elimina. La autoría es siempre del dueño.
 
 ## 5. Flujo de trabajo: proponer antes de ejecutar
 
