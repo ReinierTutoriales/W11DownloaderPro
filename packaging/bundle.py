@@ -101,7 +101,8 @@ def main() -> None:
         f"{sha256(p)}  {p.relative_to(folder).as_posix()}"
         for p in sorted(folder.rglob("*")) if p.is_file() and p != sums
     ]
-    sums.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Bytes, no texto: en Windows el modo texto cambiaría \n por \r\n y sha256sum no leería los nombres.
+    sums.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
 
     archive = args.out / f"{name}.zip"
     if archive.exists():
@@ -110,7 +111,7 @@ def main() -> None:
         for p in sorted(folder.rglob("*")):
             z.write(p, Path(name) / p.relative_to(folder))
     digest = sha256(archive)
-    (args.out / f"{name}.zip.sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    (args.out / f"{name}.zip.sha256").write_bytes(f"{digest}  {archive.name}\n".encode("utf-8"))
     print(f"\n{archive}  ({archive.stat().st_size / 1e6:.0f} MB)\nSHA-256 {digest}")
 
 
