@@ -41,6 +41,7 @@ $("scan").addEventListener("click", async () => {
       type: "send-links",
       urls: selected,
       pageUrl: tab.url,
+      queued: $("queued").checked,
     });
     const ok = results.filter((r) => r.ok).length;
     status(`Enviados: ${ok} de ${results.length}.`);
@@ -85,13 +86,14 @@ initLimit();
 
 const LABELS = {
   running: "En curso",
+  queued: "En espera",
   paused: "Pausada",
   interrupted: "Interrumpida (reanudable)",
   failed: "Fallida",
   done: "Terminada",
   canceled: "Cancelada",
 };
-const ACTION_LABELS = { pause: "Pausar", resume: "Reanudar", cancel: "Cancelar" };
+const ACTION_LABELS = { pause: "Pausar", resume: "Iniciar / reanudar", cancel: "Cancelar" };
 
 function formatMb(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;

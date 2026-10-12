@@ -19,6 +19,8 @@ pub const QUEUE_FILE: &str = ".w11dl-queue.json";
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum State {
     Running,
+    /// En espera: no empieza hasta que el usuario la inicie o se ejecute la cola programada.
+    Queued,
     Paused,
     /// Estaba en curso cuando el host se cerró. Se puede reanudar.
     Interrupted,
@@ -34,7 +36,7 @@ impl State {
     pub fn is_resumable(&self) -> bool {
         matches!(
             self,
-            State::Paused | State::Interrupted | State::Failed { .. }
+            State::Queued | State::Paused | State::Interrupted | State::Failed { .. }
         )
     }
 }
@@ -63,14 +65,15 @@ pub struct Entry {
 pub struct Registry(Arc<Mutex<Vec<Entry>>>);
 
 impl Registry {
-    /// Carga la cola guardada. Lo que estaba en curso queda como `Interrupted`.
+    /// Carga la cola guardada. Lo que estaba en curso queda como `Interrupted`; lo pausado sigue pausado.
     pub fn load(dir: &Path) -> Self {
         let text = std::fs::read_to_string(dir.join(QUEUE_FILE)).unwrap_or_default();
         let records: Vec<Record> = serde_json::from_str(&text).unwrap_or_default();
         let entries = records
             .into_iter()
             .map(|mut record| {
-                if matches!(record.state, State::Running | State::Paused) {
+                // Solo lo que corría queda interrumpido; una pausa del usuario sigue siendo una pausa.
+                if record.state == State::Running {
                     record.state = State::Interrupted;
                 }
                 Entry {
@@ -140,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn al_cargar_lo_en_curso_queda_interrumpido() {
+    fn al_cargar_lo_en_curso_queda_interrumpido_y_lo_pausado_sigue_pausado() {
         let dir = tempfile::tempdir().unwrap();
         let reg = Registry::default();
         reg.insert(record("a", State::Running), HeaderMap::new());
@@ -152,7 +155,7 @@ mod tests {
         let states: Vec<State> = loaded.records().into_iter().map(|r| r.state).collect();
         assert_eq!(
             states,
-            vec![State::Interrupted, State::Interrupted, State::Done]
+            vec![State::Interrupted, State::Paused, State::Done]
         );
     }
 
@@ -171,6 +174,7 @@ mod tests {
     #[test]
     fn estados_reanudables() {
         assert!(State::Paused.is_resumable());
+        assert!(State::Queued.is_resumable());
         assert!(State::Interrupted.is_resumable());
         assert!(!State::Running.is_resumable());
         assert!(!State::Done.is_resumable());

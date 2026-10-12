@@ -132,8 +132,11 @@
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  function enqueueMessage({ id, url, filename, headers }) {
-    return { type: "enqueue", id, url, filename, headers: headers || {} };
+  // `queued`: solo registrarla en la cola del host, sin empezar (la inicia el usuario o la cola programada).
+  function enqueueMessage({ id, url, filename, headers, queued }) {
+    const message = { type: "enqueue", id, url, filename, headers: headers || {} };
+    if (queued === true) message.queued = true;
+    return message;
   }
 
   // Página o enlace de vídeo: el host la resuelve con yt-dlp. Sin cabeceras de sesión.
@@ -142,6 +145,7 @@
     switch (state) {
       case "running":
         return ["pause", "cancel"];
+      case "queued":
       case "paused":
       case "interrupted":
       case "failed":

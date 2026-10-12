@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod queue;
 pub mod register;
 pub mod runtime;
+pub mod schedule;
 pub mod video;
 
 pub use engine::{Mode, Options, Report, download};

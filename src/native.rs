@@ -40,6 +40,11 @@ pub enum Incoming {
         filename: Option<String>,
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// Solo registrarla en la cola, sin empezar: la inicia el usuario o la cola programada.
+        /// Las cabeceras de sesión no se guardan en disco, así que una descarga que dependa de
+        /// cookies debe empezarse mientras el host siga abierto.
+        #[serde(default)]
+        queued: bool,
     },
     /// Página o enlace de vídeo: el host lo resuelve con yt-dlp antes de descargar.
     EnqueueVideo {
@@ -191,6 +196,7 @@ where
                 url,
                 filename,
                 headers,
+                queued,
             }) => match prepare(&id, &url, filename.as_deref(), &headers, &out_dir) {
                 Ok(mut job) => {
                     let _ = tx.send(Outgoing::Accepted {
@@ -208,6 +214,11 @@ where
                         job.headers.clone(),
                     );
                     let _ = registry.save(&out_dir);
+                    if queued {
+                        registry.update(&id, |e| e.record.state = State::Queued);
+                        let _ = registry.save(&out_dir);
+                        continue;
+                    }
                     let slots = Arc::clone(&slots);
                     let tx = tx.clone();
                     let registry = registry.clone();
@@ -511,6 +522,62 @@ async fn run(
         eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
     }
     let _ = tx.send(message);
+}
+
+/// Ejecuta sin navegador lo que esté en espera (`Queued`) o interrumpido, y resume el resultado.
+/// Lo usa la tarea programada: no hay proceso residente, solo esta ejecución puntual.
+pub async fn run_pending(out_dir: PathBuf) -> crate::schedule::Summary {
+    let registry = Registry::load(&out_dir);
+    let limiter = RateLimiter::new(settings::load_limit(&out_dir));
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+    // Nadie escucha los eventos: se vacían para que el canal no crezca.
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let mut jobs = tokio::task::JoinSet::new();
+    let pending: Vec<Record> = registry
+        .records()
+        .into_iter()
+        .filter(|r| matches!(r.state, State::Queued | State::Interrupted))
+        .collect();
+    let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
+    for record in pending {
+        let control = Control::default();
+        registry.update(&record.id, |e| {
+            e.control = control.clone();
+            e.record.state = State::Running;
+        });
+        let job = Job {
+            id: record.id,
+            url: record.url,
+            output: record.path,
+            headers: HeaderMap::new(),
+            control,
+        };
+        let (slots, tx, registry, out_dir, limiter) = (
+            Arc::clone(&slots),
+            tx.clone(),
+            registry.clone(),
+            out_dir.clone(),
+            Arc::clone(&limiter),
+        );
+        jobs.spawn(async move {
+            let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+            run(job, tx, registry, out_dir, limiter).await;
+        });
+    }
+    let _ = registry.save(&out_dir);
+    while jobs.join_next().await.is_some() {}
+
+    let mut summary = crate::schedule::Summary::default();
+    for id in ids {
+        match registry.get(&id).map(|e| e.record.state) {
+            Some(State::Done) => summary.done += 1,
+            Some(State::Failed { .. }) => summary.failed += 1,
+            _ => summary.canceled += 1,
+        }
+    }
+    summary
 }
 
 /// Ajustes persistentes del host (solo el límite de velocidad; nada de sesión).

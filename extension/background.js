@@ -124,8 +124,8 @@ function request(build, timeoutMs) {
 }
 
 // Archivo directo: el host lo descarga. Sin acuse, el navegador conserva la descarga.
-function handoff({ url, filename, headers }) {
-  return request((id) => self.W11DL.enqueueMessage({ id, url, filename, headers }), HANDOFF_TIMEOUT_MS);
+function handoff({ url, filename, headers, queued }) {
+  return request((id) => self.W11DL.enqueueMessage({ id, url, filename, headers, queued }), HANDOFF_TIMEOUT_MS);
 }
 
 // Vídeo: el host resuelve la página con yt-dlp y después la descarga.
@@ -229,11 +229,12 @@ async function sendVideo(page) {
   }
 }
 
-async function sendOne(url, pageUrl) {
+async function sendOne(url, pageUrl, queued = false) {
   if (!self.W11DL.isWebUrl(url)) return { url, ok: false, error: "URL no web" };
   try {
-    const headers = await sessionHeaders(url, pageUrl);
-    await handoff({ url, filename: self.W11DL.fileNameFrom(url), headers });
+    // Una descarga en espera no lleva cookies: el host no las guarda en disco y no estarían al empezar.
+    const headers = queued ? {} : await sessionHeaders(url, pageUrl);
+    await handoff({ url, filename: self.W11DL.fileNameFrom(url), headers, queued });
     return { url, ok: true };
   } catch (err) {
     setBadge("!");
@@ -345,7 +346,7 @@ browser.runtime.onMessage.addListener(async (msg) => {
       const urls = Array.isArray(msg.urls) ? msg.urls.slice(0, MAX_LINKS_PER_SEND) : [];
       const results = [];
       // Secuencial: el host ya paraleliza las descargas; enviar en ráfaga solo llenaría su cola.
-      for (const url of urls) results.push(await sendOne(url, msg.pageUrl));
+      for (const url of urls) results.push(await sendOne(url, msg.pageUrl, msg.queued === true));
       return { results };
     }
     default:

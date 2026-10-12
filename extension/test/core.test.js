@@ -100,3 +100,9 @@ test("mensaje de límite: consulta, valor válido y valores inválidos", () => {
   for (const bad of [-1, 1.5, NaN, Infinity, "5", null]) assert.equal(core.limitMessage(bad), null);
   assert.equal(core.LIMIT_CHOICES[0].value, 0);
 });
+
+test("descarga en espera: el mensaje lo marca y las acciones permiten iniciarla", () => {
+  assert.equal(core.enqueueMessage({ id: "1", url: "https://x.test/a", filename: "a", queued: true }).queued, true);
+  assert.equal("queued" in core.enqueueMessage({ id: "1", url: "https://x.test/a", filename: "a" }), false);
+  assert.deepEqual(core.queueActions("queued"), ["resume", "cancel"]);
+});
