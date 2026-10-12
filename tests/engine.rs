@@ -18,7 +18,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use w11dl::plan::{self, State};
+use w11dl::plan::{self, State, Validators};
 use w11dl::{Error, Mode, Options, download};
 
 const ETAG_VALUE: &str = "\"v1\"";
@@ -30,9 +30,21 @@ struct Server {
     fail_first: AtomicUsize,
     /// Peticiones de fragmento recibidas (excluye el sondeo `bytes=0-0`).
     chunk_requests: AtomicUsize,
+    etag: Option<&'static str>,
+    last_modified: Option<&'static str>,
 }
 
 async fn start(data: Vec<u8>, ranges: bool, fail_first: usize) -> (SocketAddr, Arc<Server>) {
+    start_with(data, ranges, fail_first, Some(ETAG_VALUE), None).await
+}
+
+async fn start_with(
+    data: Vec<u8>,
+    ranges: bool,
+    fail_first: usize,
+    etag: Option<&'static str>,
+    last_modified: Option<&'static str>,
+) -> (SocketAddr, Arc<Server>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = Arc::new(Server {
@@ -40,6 +52,8 @@ async fn start(data: Vec<u8>, ranges: bool, fail_first: usize) -> (SocketAddr, A
         ranges,
         fail_first: AtomicUsize::new(fail_first),
         chunk_requests: AtomicUsize::new(0),
+        etag,
+        last_modified,
     });
 
     let accepting = Arc::clone(&server);
@@ -86,31 +100,44 @@ fn handle(server: &Server, req: Request<Incoming>) -> Response<Full<Bytes>> {
 
     let len = server.data.len() as u64;
     let range = range_header.as_deref().and_then(parse_range);
-    let if_range_ok = req
-        .headers()
-        .get(IF_RANGE)
-        .is_none_or(|v| v.as_bytes() == ETAG_VALUE.as_bytes());
+    let if_range_ok = req.headers().get(IF_RANGE).is_none_or(|v| {
+        // If-Range exige coincidencia fuerte: un ETag débil nunca cuenta.
+        let strong = server.etag.filter(|t| !t.starts_with("W/"));
+        strong.is_some_and(|t| t.as_bytes() == v.as_bytes())
+            || server
+                .last_modified
+                .is_some_and(|t| t.as_bytes() == v.as_bytes())
+    });
 
     match range {
         Some((start, end)) if server.ranges && if_range_ok => {
             let end = end.min(len - 1);
             let body = server.data[start as usize..=end as usize].to_vec();
-            Response::builder()
-                .status(206)
-                .header(ETAG, ETAG_VALUE)
+            identity(Response::builder().status(206), server)
                 .header(CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
                 .header(CONTENT_LENGTH, body.len())
                 .body(Full::new(Bytes::from(body)))
                 .unwrap()
         }
-        _ => Response::builder()
-            .status(200)
-            .header(ETAG, ETAG_VALUE)
+        _ => identity(Response::builder().status(200), server)
             .header(ACCEPT_RANGES, if server.ranges { "bytes" } else { "none" })
             .header(CONTENT_LENGTH, len)
             .body(Full::new(Bytes::from(server.data.clone())))
             .unwrap(),
     }
+}
+
+fn identity(
+    mut builder: hyper::http::response::Builder,
+    server: &Server,
+) -> hyper::http::response::Builder {
+    if let Some(tag) = server.etag {
+        builder = builder.header(ETAG, tag);
+    }
+    if let Some(lm) = server.last_modified {
+        builder = builder.header(hyper::header::LAST_MODIFIED, lm);
+    }
+    builder
 }
 
 fn status_only(code: u16) -> Response<Full<Bytes>> {
@@ -280,7 +307,12 @@ async fn reanuda_solo_los_fragmentos_pendientes() {
     let mut opts = options(url.clone(), out.clone());
     let chunk_size =
         plan::effective_chunk_size(data.len() as u64, opts.connections, opts.max_chunk);
-    let mut state = State::new(&url, data.len() as u64, chunk_size, Some(ETAG_VALUE.into()));
+    let mut state = State::new(
+        &url,
+        data.len() as u64,
+        chunk_size,
+        Validators::new(Some(ETAG_VALUE.into()), None),
+    );
     let chunks = plan::plan(data.len() as u64, chunk_size);
     let half = chunks.len() / 2;
     let mut partial = vec![0u8; data.len()];
@@ -335,7 +367,12 @@ async fn estado_de_otro_plan_se_descarta_y_no_corrompe_el_archivo() {
     let chunk_size =
         plan::effective_chunk_size(data.len() as u64, opts.connections, opts.max_chunk);
     let right_len = plan::plan(data.len() as u64, chunk_size).len();
-    let mut stale = State::new(&url, data.len() as u64, chunk_size, Some(ETAG_VALUE.into()));
+    let mut stale = State::new(
+        &url,
+        data.len() as u64,
+        chunk_size,
+        Validators::new(Some(ETAG_VALUE.into()), None),
+    );
     stale.done = vec![true; right_len + 5];
     std::fs::write(dir.path().join("viejo.bin.part"), vec![0u8; data.len()]).unwrap();
     std::fs::write(
@@ -355,4 +392,91 @@ async fn estado_de_otro_plan_se_descarta_y_no_corrompe_el_archivo() {
         data,
         "el archivo publicado debe ser el correcto"
     );
+}
+
+/// Prepara un parcial con la primera mitad completada, firmado con `saved`.
+fn interrupted(
+    dir: &std::path::Path,
+    name: &str,
+    data: &[u8],
+    url: &str,
+    saved: Validators,
+) -> (Options, usize, usize) {
+    let opts = options(url.to_owned(), dir.join(name));
+    let chunk_size =
+        plan::effective_chunk_size(data.len() as u64, opts.connections, opts.max_chunk);
+    let mut state = State::new(url, data.len() as u64, chunk_size, saved);
+    let chunks = plan::plan(data.len() as u64, chunk_size);
+    let half = chunks.len() / 2;
+    let mut partial = vec![0u8; data.len()];
+    for c in chunks.iter().take(half) {
+        partial[c.start as usize..=c.end as usize]
+            .copy_from_slice(&data[c.start as usize..=c.end as usize]);
+        state.done[c.index] = true;
+    }
+    std::fs::write(dir.join(format!("{name}.part")), &partial).unwrap();
+    std::fs::write(
+        dir.join(format!("{name}.part.state")),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    (opts, chunks.len(), half)
+}
+
+#[tokio::test]
+async fn recurso_cambiado_en_el_servidor_no_se_reanuda() {
+    let data = payload(2 * 1024 * 1024);
+    let (addr, server) = start(data.clone(), true, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    // El parcial es de otra versión (ETag distinto) y está lleno de ceros marcados como hechos.
+    let (opts, chunks, _) = interrupted(
+        dir.path(),
+        "cambiado.bin",
+        &data,
+        &url,
+        Validators::new(Some("\"v0\"".into()), None),
+    );
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(report.resumed, 0);
+    assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks);
+    assert_eq!(
+        std::fs::read(dir.path().join("cambiado.bin")).unwrap(),
+        data
+    );
+}
+
+#[tokio::test]
+async fn servidor_sin_validadores_reanuda_por_tamano() {
+    let data = payload(2 * 1024 * 1024);
+    let (addr, server) = start_with(data.clone(), true, 0, None, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let (opts, chunks, half) =
+        interrupted(dir.path(), "sinval.bin", &data, &url, Validators::default());
+
+    let report = download(opts).await.unwrap();
+
+    assert!(report.resumed > 0, "debe reanudar aunque no haya ETag");
+    assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks - half);
+    assert_eq!(std::fs::read(dir.path().join("sinval.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn etag_debil_usa_last_modified_en_if_range_y_reanuda() {
+    let data = payload(2 * 1024 * 1024);
+    let lm = "Wed, 21 Oct 2026 07:28:00 GMT";
+    let (addr, server) = start_with(data.clone(), true, 0, Some("W/\"v1\""), Some(lm)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let saved = Validators::new(Some("W/\"v1\"".into()), Some(lm.into()));
+    let (opts, chunks, half) = interrupted(dir.path(), "debil.bin", &data, &url, saved);
+
+    let report = download(opts).await.unwrap();
+
+    assert!(report.resumed > 0);
+    assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks - half);
+    assert_eq!(std::fs::read(dir.path().join("debil.bin")).unwrap(), data);
 }

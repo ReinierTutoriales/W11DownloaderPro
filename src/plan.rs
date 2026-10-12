@@ -286,6 +286,36 @@ pub fn plan(total: u64, chunk_size: u64) -> Vec<Chunk> {
     chunks
 }
 
+/// Validadores del recurso remoto: lo que permite saber si sigue siendo el mismo archivo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    pub fn new(etag: Option<String>, last_modified: Option<String>) -> Self {
+        Self {
+            etag,
+            last_modified,
+        }
+    }
+
+    /// Valor para `If-Range`. La RFC 9110 §13.1.5 solo admite validadores fuertes: un `ETag`
+    /// débil (`W/"…"`) nunca coincide, así que se usa `Last-Modified` en su lugar.
+    pub fn if_range(&self) -> Option<&str> {
+        match self.etag.as_deref() {
+            Some(tag) if !tag.starts_with("W/") => Some(tag),
+            _ => self.last_modified.as_deref(),
+        }
+    }
+}
+
+/// `ETag` sin el prefijo débil ni espacios, para comparar el recurso (no para `If-Range`).
+fn etag_core(tag: &str) -> &str {
+    tag.trim().trim_start_matches("W/")
+}
+
 /// Estado persistido junto al archivo parcial. Permite reanudar sin volver a bajar lo completado.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
@@ -294,29 +324,41 @@ pub struct State {
     pub chunk_size: u64,
     /// Validador `ETag` de la respuesta original. Si cambia, el estado ya no es válido.
     pub etag: Option<String>,
+    /// `Last-Modified` de la respuesta original. Estados antiguos no lo traen.
+    #[serde(default)]
+    pub last_modified: Option<String>,
     pub done: Vec<bool>,
 }
 
 impl State {
-    pub fn new(url: &str, total: u64, chunk_size: u64, etag: Option<String>) -> Self {
+    pub fn new(url: &str, total: u64, chunk_size: u64, validators: Validators) -> Self {
         let count = plan(total, chunk_size).len();
         Self {
             url: url.to_owned(),
             total,
             chunk_size,
-            etag,
+            etag: validators.etag,
+            last_modified: validators.last_modified,
             done: vec![false; count],
         }
     }
 
     /// Indica si este estado sigue siendo válido para el recurso actual.
-    pub fn matches(&self, url: &str, total: u64, etag: Option<&str>) -> bool {
+    ///
+    /// El tamaño y la URL deben coincidir siempre (prueba). Cada validador presente en ambos
+    /// lados debe coincidir (indicio): si cualquiera difiere, el archivo cambió. Si el servidor
+    /// no ofrece validadores comparables, se reanuda por tamaño; con `--sha256` el resultado
+    /// final se verifica igualmente.
+    pub fn matches(&self, url: &str, total: u64, current: &Validators) -> bool {
         self.url == url
             && self.total == total
-            && match (&self.etag, etag) {
-                (Some(saved), Some(current)) => saved == current,
-                // Sin validador no hay forma de comprobar el recurso: no se reanuda.
-                _ => false,
+            && match (&self.etag, &current.etag) {
+                (Some(a), Some(b)) => etag_core(a) == etag_core(b),
+                _ => true,
+            }
+            && match (&self.last_modified, &current.last_modified) {
+                (Some(a), Some(b)) => a.trim() == b.trim(),
+                _ => true,
             }
     }
 
@@ -602,19 +644,49 @@ mod tests {
         assert_eq!(effective_chunk_size(u64::MAX / 2, 8, 4 << 20), 4 << 20);
     }
 
+    fn v(etag: Option<&str>, lm: Option<&str>) -> Validators {
+        Validators::new(etag.map(Into::into), lm.map(Into::into))
+    }
+
     #[test]
-    fn estado_rechaza_recurso_cambiado_o_sin_validador() {
-        let s = State::new("http://x/a", 100, 10, Some("\"v1\"".into()));
-        assert!(s.matches("http://x/a", 100, Some("\"v1\"")));
-        assert!(!s.matches("http://x/a", 100, Some("\"v2\"")));
-        assert!(!s.matches("http://x/a", 101, Some("\"v1\"")));
-        assert!(!s.matches("http://x/b", 100, Some("\"v1\"")));
-        assert!(!s.matches("http://x/a", 100, None));
+    fn estado_rechaza_recurso_cambiado() {
+        let s = State::new("http://x/a", 100, 10, v(Some("\"v1\""), Some("Mon")));
+        assert!(s.matches("http://x/a", 100, &v(Some("\"v1\""), Some("Mon"))));
+        assert!(!s.matches("http://x/a", 100, &v(Some("\"v2\""), Some("Mon"))));
+        assert!(!s.matches("http://x/a", 100, &v(Some("\"v1\""), Some("Tue"))));
+        assert!(!s.matches("http://x/a", 101, &v(Some("\"v1\""), Some("Mon"))));
+        assert!(!s.matches("http://x/b", 100, &v(Some("\"v1\""), Some("Mon"))));
+    }
+
+    #[test]
+    fn etag_debil_y_fuerte_del_mismo_recurso_coinciden() {
+        let s = State::new("http://x/a", 100, 10, v(Some("W/\"v1\""), None));
+        assert!(s.matches("http://x/a", 100, &v(Some("\"v1\""), None)));
+        assert!(!s.matches("http://x/a", 100, &v(Some("W/\"v2\""), None)));
+    }
+
+    #[test]
+    fn sin_validadores_comparables_se_reanuda_por_tamano() {
+        let s = State::new("http://x/a", 100, 10, v(None, None));
+        assert!(s.matches("http://x/a", 100, &v(None, None)));
+        assert!(!s.matches("http://x/a", 99, &v(None, None)));
+        // Solo Last-Modified en un lado y ETag en el otro: no hay nada comparable.
+        let s = State::new("http://x/a", 100, 10, v(None, Some("Mon")));
+        assert!(s.matches("http://x/a", 100, &v(Some("\"e\""), None)));
+        assert!(!s.matches("http://x/a", 100, &v(None, Some("Tue"))));
+    }
+
+    #[test]
+    fn if_range_usa_solo_validadores_fuertes() {
+        assert_eq!(v(Some("\"a\""), Some("Mon")).if_range(), Some("\"a\""));
+        assert_eq!(v(Some("W/\"a\""), Some("Mon")).if_range(), Some("Mon"));
+        assert_eq!(v(Some("W/\"a\""), None).if_range(), None);
+        assert_eq!(v(None, Some("Mon")).if_range(), Some("Mon"));
     }
 
     #[test]
     fn bytes_completados_cuentan_solo_fragmentos_marcados() {
-        let mut s = State::new("http://x/a", 25, 10, None);
+        let mut s = State::new("http://x/a", 25, 10, Validators::default());
         s.done[0] = true;
         s.done[2] = true;
         assert_eq!(s.completed_bytes(), 10 + 5);

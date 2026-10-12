@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 
 use crate::error::{Error, Result};
 use crate::net::{self, HttpClient, Remote};
-use crate::plan::{self, Chunk, State};
+use crate::plan::{self, Chunk, State, Validators};
 use crate::proxy::ProxyMode;
 
 pub const DEFAULT_CONNECTIONS: usize = 8;
@@ -219,10 +219,11 @@ async fn segmented(
     let url = remote.url.to_string();
     let chunk_size = plan::effective_chunk_size(total, opts.connections, opts.max_chunk);
 
+    let validators = Validators::new(remote.etag.clone(), remote.last_modified.clone());
     let resumable = load_state(state_path)
         .await
         .filter(|s| {
-            s.matches(&url, total, remote.etag.as_deref())
+            s.matches(&url, total, &validators)
                 && s.chunk_size == chunk_size
                 // Un estado hecho con otro plan de fragmentos tendría índices que no corresponden.
                 && s.done.len() == plan::plan(total, chunk_size).len()
@@ -231,7 +232,7 @@ async fn segmented(
 
     let fresh = resumable.is_none();
     let state =
-        resumable.unwrap_or_else(|| State::new(&url, total, chunk_size, remote.etag.clone()));
+        resumable.unwrap_or_else(|| State::new(&url, total, chunk_size, validators.clone()));
     let file = Arc::new(open_part(part, fresh, total).await?);
 
     let resumed = state.completed_bytes();
@@ -252,7 +253,7 @@ async fn segmented(
         control: control.clone(),
         url: remote.url.clone(),
         headers: headers.clone(),
-        etag: remote.etag.clone(),
+        if_range: validators.if_range().map(str::to_owned),
         pending,
         cursor: AtomicUsize::new(0),
         unflushed: AtomicUsize::new(0),
@@ -382,7 +383,8 @@ struct Shared {
     control: Control,
     url: Uri,
     headers: HeaderMap,
-    etag: Option<String>,
+    /// Validador fuerte para `If-Range`.
+    if_range: Option<String>,
     pending: Vec<Chunk>,
     /// Siguiente índice de `pending` a reclamar. Reparto dinámico: quien termina antes toma más trabajo.
     cursor: AtomicUsize,
@@ -564,7 +566,7 @@ async fn fetch_with_retry(shared: &Shared, chunk: Chunk) -> Result<Fetched> {
             &shared.client,
             &shared.url,
             chunk,
-            shared.etag.as_deref(),
+            shared.if_range.as_deref(),
             &shared.headers,
             &shared.rx_bytes,
         )
