@@ -79,7 +79,7 @@ Sin ffmpeg no se delega ni se une (explica la dependencia con enlace).
 
 | Conjunto | Resultado de la última ejecución |
 |---|---|
-| Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 134 pasan, 0 fallan |
+| Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 165 pasan, 0 fallan |
 | Extensión (`npm test`) | 24 pasan, 1 omitida (vídeo, requiere `W11DL_PYTHON`) |
 | Botón en Chromium con Playwright (`test/video-button.dom.js`) | 6 comprobaciones OK |
 | `cargo clippy --all-targets -- -D warnings` | sin avisos |
@@ -114,6 +114,25 @@ Integración real: servidores locales con rangos, lentitud, rechazos, enlace rev
 12. **No se ha ejecutado `cargo audit` ni `cargo deny`** (no instalados en este entorno).
 
 Procedimiento: varios cambios (p. ej. el selector de vídeo, la serialización de checkpoints, la carpeta de intermedios) se implementaron tras una aprobación general del dueño ("continúa", "ok") y no con una propuesta individual previa, que es lo que pide `POLITICAS.md` §5.
+
+## 7 bis. Revisión cruzada 1 (hallazgos de una segunda revisión, contrastados uno a uno con el código)
+
+Cada hallazgo se comprobó leyendo el código y, cuando fue posible, **reproduciéndolo con una prueba que fallaba antes del arreglo**.
+
+| # | Hallazgo | Comprobación | Corrección | Prueba |
+|---|---|---|---|---|
+| 1 | Dos descargas con el mismo nombre comparten archivo, parcial y estado | **Reproducido**: tres peticiones en espera recibían la misma ruta; un parcial ajeno no ocupaba el nombre | Destino adjudicado de forma atómica (disco, cola, reservas, extensiones posibles de un vídeo) | `tests/destinos.rs` |
+| 1b | Dos escritores sobre la misma ruta | **Reproducido** (la segunda fallaba con `NotFound` y pisaba el parcial) | Bloqueo exclusivo del sistema sobre el parcial; la segunda recibe `Busy` | `dos_descargas_a_la_misma_ruta_no_se_pisan` |
+| 2 | `Content-Range` del fragmento sin validar | **Reproducido** en 4 casos (otra posición, sin cabecera, otro inicio, otro tamaño total): se publicaba un archivo corrupto | Se exige posición exacta y mismo tamaño total | `tests/rangos.rs`, unitarias en `net.rs` |
+| 3 | Longitud del parcial no comprobada al reanudar | **Reproducido** (truncado y con bytes de más) | Solo se reanuda si el parcial mide exactamente el tamaño final | `parcial_truncado…`, `parcial_mas_largo…` |
+| 4 | Cookies reenviadas al degradar https a http en el mismo host | Confirmado por lectura (solo se comparaba el host); **no reproducido de extremo a extremo** (haría falta un servidor HTTPS) | `may_forward_session`: mismo sitio, sin degradar el cifrado | Unitarias en `net.rs` y `engine.rs` |
+| 5 | Guardado de la cola sin serializar | **Reproducido**: 222 de 480 guardados fallaban | Candado que cubre captura, escritura y renombrado; el primer fallo se comunica una vez | `guardados_simultaneos…`, `un_guardado_que_falla_avisa…` |
+| 6 | Sin tiempos de inactividad; pausa/cancelación esperaban a la red | **Reproducido** en 8 casos (servidor callado en sondeo, fragmentos, datos y sin rangos) | Inactividad máxima de 30 s por espera (configurable) y el control corta cualquier espera | `tests/bloqueos.rs` |
+| 7 | `Last-Modified` tratado siempre como fuerte | Confirmado por lectura | Solo es fuerte si es ≥ 1 s anterior a `Date` (RFC 9110 §8.8.2.2); si no, ni `If-Range` ni verificación | Unitarias y `last_modified_en_el_futuro…` |
+
+Hallazgos propios de esta ronda: en Unix, el yt-dlp autónomo dejaba un proceso hijo vivo al cancelar (prueba intermitente), ahora se mata el grupo de procesos entero; clippy más estricto con Rust 1.89 (mínimo actualizado).
+Se añadió a la CI un trabajo `calidad`: `cargo fmt --check`, `cargo clippy -D warnings` y `cargo audit` (RustSec). **`cargo audit` ejecutado localmente: 0 vulnerabilidades en 194 dependencias** (base de avisos de hoy).
+Siguen sin verificarse: los efectos del bloqueo de archivos de Windows (mandatorio) en la CI de Windows de esta rama, y todo lo de la sección 8.
 
 ## 8. No verificado
 

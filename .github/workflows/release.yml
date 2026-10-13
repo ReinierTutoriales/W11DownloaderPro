@@ -16,7 +16,24 @@ permissions:
   contents: read
 
 jobs:
+  calidad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Formato
+        run: cargo fmt --check
+
+      - name: Análisis estático (Clippy, avisos como errores)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Auditoría de dependencias (RustSec)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
   windows:
+    needs: calidad
     runs-on: windows-latest
     permissions:
       contents: write # solo se usa al publicar la release
