@@ -90,13 +90,33 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
     let output = base.output.clone();
     let video_file = with_suffix(&output, ".video");
     let audio_file = with_suffix(&output, ".audio");
-    // Ambas pistas suman en el mismo contador: el progreso es el de la descarga completa.
+    // El avance visible es la suma de los bytes VÁLIDOS de cada pista (cada una con su contador): una
+    // pista descartada y vuelta a bajar no lo infla. Lo transferido y luego descartado se contabiliza
+    // aparte (`wasted`) y se suma al tráfico de red del informe.
     let progress = base
         .progress
         .clone()
         .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    let (video_bytes, audio_bytes) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let wasted = Arc::new(AtomicU64::new(0));
+    let aggregate = {
+        let (progress, v, a) = (
+            Arc::clone(&progress),
+            Arc::clone(&video_bytes),
+            Arc::clone(&audio_bytes),
+        );
+        tokio::spawn(async move {
+            loop {
+                progress.store(
+                    v.load(Ordering::Relaxed) + a.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+    };
 
-    let part = |track: &Track, file: &Path| {
+    let part = |track: &Track, file: &Path, counter: &Arc<AtomicU64>| {
         let mut o = base.clone();
         o.url = track.url.clone();
         o.headers = track.headers.clone();
@@ -106,15 +126,22 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
         {
             o.gate = None;
         }
-        o.progress = Some(Arc::clone(&progress));
+        o.progress = Some(Arc::clone(counter));
         o
     };
-    let (video_opts, audio_opts) = (part(&job.video, &video_file), part(&job.audio, &audio_file));
+    let video_opts = part(&job.video, &video_file, &video_bytes);
+    let audio_opts = part(&job.audio, &audio_file, &audio_bytes);
 
-    let (v, a) = tokio::try_join!(
-        fetch_track(video_opts, control.clone()),
-        fetch_track(audio_opts, control.clone())
-    )?;
+    let fetched = tokio::try_join!(
+        fetch_track(video_opts, control.clone(), &wasted),
+        fetch_track(audio_opts, control.clone(), &wasted)
+    );
+    aggregate.abort();
+    let (v, a) = fetched?;
+    progress.store(
+        video_bytes.load(Ordering::Relaxed) + audio_bytes.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
 
     match (v, a) {
         (Outcome::Canceled, _) | (_, Outcome::Canceled) => {
@@ -161,7 +188,7 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
             progress.store(bytes, Ordering::Relaxed);
             Ok(Outcome::Completed(Report {
                 bytes,
-                downloaded: rv.downloaded + ra.downloaded,
+                downloaded: rv.downloaded + ra.downloaded + wasted.load(Ordering::Relaxed),
                 resumed: rv.resumed + ra.resumed,
                 elapsed: started.elapsed(),
                 mode: rv.mode,
@@ -280,7 +307,7 @@ fn stopped(control: &Control) -> Outcome {
 /// validador fuerte); si no puede comprobarse, se vuelve a descargar. Reutilizarla a ciegas podría unir
 /// pistas de selecciones o contenidos distintos. Todas las esperas atienden pausa y cancelación, y el
 /// control se comprueba antes de borrar, reutilizar o certificar.
-async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
+async fn fetch_track(opts: Options, control: Control, wasted: &AtomicU64) -> Result<Outcome> {
     if let Ok(meta) = tokio::fs::metadata(&opts.output).await {
         let saved = read_manifest(&opts.output).await;
         let Some(now) = identify_or_stop(&opts, &control).await else {
@@ -328,6 +355,10 @@ async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
             // número acotado de intentos.
             (Some(before), Some(after)) if before != after => {
                 engine::remove_if_exists(&opts.output).await?;
+                // Lo bajado en este intento se descarta: sale del avance y queda como tráfico gastado.
+                if let Some(p) = &opts.progress {
+                    wasted.fetch_add(p.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+                }
                 if attempt == TRACK_ATTEMPTS {
                     return Err(Error::Video(format!(
                         "el recurso cambió mientras se descargaba ({TRACK_ATTEMPTS} intentos): {}",

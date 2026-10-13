@@ -651,3 +651,35 @@ async fn si_el_recurso_se_estabiliza_en_un_reintento_se_certifica_y_continua() {
     control.cancel();
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn una_pista_descartada_no_infla_el_avance_y_si_cuenta_como_trafico() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("final.mp4");
+    // El vídeo (30 000 B) se descarta una vez por cambio de identidad; el sonido (20 000 B) no.
+    let addr = changing_server(payload(30_000), 1).await;
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let gate = std::sync::Arc::new(w11dl::engine::Gate::default());
+    let mut opts = Options::new("ignorada", &out);
+    opts.progress = Some(std::sync::Arc::clone(&progress));
+    opts.gate = Some(std::sync::Arc::clone(&gate));
+    let handle = tokio::spawn(download_merged(
+        opts,
+        job(addr, quick_ffmpeg(dir.path())),
+        Control::default(),
+    ));
+    gate.reached.acquire().await.unwrap().forget();
+    assert_eq!(
+        progress.load(std::sync::atomic::Ordering::Relaxed),
+        50_000,
+        "el avance cuenta solo los bytes válidos conservados"
+    );
+    gate.release.add_permits(1);
+    let Outcome::Completed(report) = handle.await.unwrap().unwrap() else {
+        panic!("debía completarse")
+    };
+    assert_eq!(
+        report.downloaded, 80_000,
+        "el tráfico incluye los 30 000 B descartados: {report:?}"
+    );
+}
