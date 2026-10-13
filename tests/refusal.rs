@@ -129,6 +129,17 @@ async fn run(
     let mut opts = Options::new(format!("http://{addr}/f.bin"), out.clone());
     opts.connections = 8;
     opts.max_chunk = 256 * 1024;
+    // Referencia en esta misma máquina: un único flujo contra un servidor sin límite.
+    let baseline = {
+        let (addr, _) = limited(Arc::new(data.clone()), 64, status, None).await;
+        let d = tempfile::tempdir().unwrap();
+        let mut o = Options::new(format!("http://{addr}/f.bin"), d.path().join("b.bin"));
+        o.connections = 1;
+        o.max_chunk = 256 * 1024;
+        let t = std::time::Instant::now();
+        download(o).await.expect("la referencia debe completar");
+        t.elapsed()
+    };
     let started = std::time::Instant::now();
     let result = download(opts).await.map(|_| ()).map_err(|e| e.to_string());
     let elapsed = started.elapsed();
@@ -139,8 +150,8 @@ async fn run(
         stats.refused.load(Ordering::SeqCst)
     );
     assert!(
-        elapsed < Duration::from_millis(1700),
-        "con un solo flujo aceptado debe terminar en ~1 s, no esperar reintentos: {elapsed:?}"
+        elapsed < baseline.mul_f64(1.6) + Duration::from_millis(500),
+        "con un solo flujo aceptado debe tardar como la referencia ({baseline:?}), no esperar reintentos: {elapsed:?}"
     );
     assert!(
         stats.refused.load(Ordering::SeqCst) <= 8,

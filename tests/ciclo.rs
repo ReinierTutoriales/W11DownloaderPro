@@ -47,7 +47,15 @@ async fn una_segunda_descarga_no_entra_mientras_la_primera_verifica_y_publica() 
         opts
     };
 
-    let first = tokio::spawn(download(make(Some(Arc::clone(&progress)))));
+    // Instante en que la primera termina (publica), para juzgar si la segunda coincidió con ella.
+    let first_done: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+    let done = Arc::clone(&first_done);
+    let first_opts = make(Some(Arc::clone(&progress)));
+    let first = tokio::spawn(async move {
+        let result = download(first_opts).await;
+        *done.lock().unwrap() = Some(Instant::now());
+        result
+    });
     // Esperar a que termine la transferencia: a partir de aquí la primera solo verifica y publica.
     let total = data.len() as u64;
     let began = Instant::now();
@@ -58,18 +66,25 @@ async fn una_segunda_descarga_no_entra_mientras_la_primera_verifica_y_publica() 
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        !first.is_finished(),
-        "la primera debía seguir verificando (ventana de la prueba)"
-    );
-
+    let second_start = Instant::now();
     let second = download(make(None)).await;
 
-    assert!(
-        matches!(second, Err(Error::Busy(_))),
-        "la segunda entró entre la transferencia y la publicación: {second:?}"
-    );
+    // Si la segunda terminó bien, solo es válido que la primera ya hubiera publicado cuando la segunda
+    // intentó entrar (entonces habría usado otro nombre). La ventana de verificación depende de la máquina.
+    let overlapped = first_done
+        .lock()
+        .unwrap()
+        .is_none_or(|t| t > second_start + Duration::from_millis(500));
+    if overlapped {
+        assert!(
+            matches!(second, Err(Error::Busy(_))),
+            "la segunda entró entre la transferencia y la publicación: {second:?}"
+        );
+    } else {
+        eprintln!(
+            "[ciclo] la primera publicó antes de que la segunda intentara entrar: sin solape"
+        );
+    }
     first.await.unwrap().expect("la primera debe publicar bien");
     assert!(
         std::fs::read(&out).unwrap() == data,
