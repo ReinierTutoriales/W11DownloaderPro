@@ -19,6 +19,19 @@ use crate::proxy::{ProxyConnector, ProxyMode};
 pub type HttpClient = Client<HttpsConnector<ProxyConnector>, Empty<Bytes>>;
 
 const MAX_REDIRECTS: usize = 10;
+/// Inactividad máxima en peticiones pequeñas (páginas, `robots.txt`).
+const SMALL_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Espera `fut` como mucho `idle`; si el servidor se calla, es un error reintentable y no un bloqueo.
+async fn within<T>(
+    idle: std::time::Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::time::timeout(idle, fut)
+        .await
+        .map_err(|_| Error::Timeout(format!("{} s ({what})", idle.as_secs_f32())))
+}
 const USER_AGENT_VALUE: &str = concat!("w11dl/", env!("CARGO_PKG_VERSION"));
 
 /// Aplica cabeceras propias de la descarga (p. ej. cookies de la sesión del navegador).
@@ -88,7 +101,12 @@ pub fn parse_url(raw: &str) -> Result<Uri> {
 
 /// Sondea el recurso con `Range: bytes=0-0`. Sigue redirecciones manualmente
 /// para conocer la URL final y evita descargar el cuerpo.
-pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<Remote> {
+pub async fn probe(
+    client: &HttpClient,
+    raw: &str,
+    extra: &HeaderMap,
+    idle: std::time::Duration,
+) -> Result<Remote> {
     let mut uri = parse_url(raw)?;
     let origin = uri.clone();
 
@@ -105,7 +123,7 @@ pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<
             apply_extra(&mut req, extra);
         }
 
-        let resp = client.request(req).await?;
+        let resp = within(idle, "sondeo", client.request(req)).await??;
         let status = resp.status();
         let headers = resp.headers();
 
@@ -160,16 +178,39 @@ pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<
 ///
 /// Cada bloque recibido se suma a todos los contadores de `received` al llegar (no al terminar el fragmento): así la
 /// velocidad medida es continua y las conexiones nuevas aportan desde el primer byte.
+/// Qué pedir y con qué comprobaciones.
+pub struct ChunkRequest<'a> {
+    pub url: &'a Uri,
+    pub chunk: Chunk,
+    /// Validador fuerte para `If-Range`.
+    pub if_range: Option<&'a str>,
+    pub extra: &'a HeaderMap,
+    /// Tamaño total del recurso: la respuesta debe declararlo igual.
+    pub total: u64,
+    /// Inactividad máxima en cada espera.
+    pub idle: std::time::Duration,
+}
+
+/// Dónde se anotan los bytes recibidos y cómo se frena la lectura.
+pub struct Sinks<'a> {
+    pub received: &'a [&'a std::sync::atomic::AtomicU64],
+    pub limiter: Option<&'a crate::limits::RateLimiter>,
+}
+
 pub async fn fetch_chunk(
     client: &HttpClient,
-    url: &Uri,
-    chunk: Chunk,
-    etag: Option<&str>,
-    extra: &HeaderMap,
-    total: u64,
-    received: &[&std::sync::atomic::AtomicU64],
-    limiter: Option<&crate::limits::RateLimiter>,
+    request: &ChunkRequest<'_>,
+    sinks: &Sinks<'_>,
 ) -> Result<Bytes> {
+    let ChunkRequest {
+        url,
+        chunk,
+        if_range: etag,
+        extra,
+        total,
+        idle,
+    } = *request;
+    let Sinks { received, limiter } = *sinks;
     let mut builder = Request::builder()
         .method(Method::GET)
         .uri(url)
@@ -184,7 +225,7 @@ pub async fn fetch_chunk(
         .map_err(|e| Error::InvalidUrl(e.to_string()))?;
     apply_extra(&mut req, extra);
 
-    let resp = client.request(req).await?;
+    let resp = within(idle, "fragmento", client.request(req)).await??;
     let status = resp.status();
     if status != StatusCode::PARTIAL_CONTENT {
         return Err(Error::RangeIgnored(status.as_u16()));
@@ -195,7 +236,7 @@ pub async fn fetch_chunk(
     let expected = chunk.len();
     let mut body = resp.into_body();
     let mut buf = bytes::BytesMut::with_capacity(expected as usize);
-    while let Some(frame) = body.frame().await {
+    while let Some(frame) = within(idle, "datos", body.frame()).await? {
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
             if let Some(limiter) = limiter {
@@ -228,6 +269,7 @@ pub async fn get_full(
     client: &HttpClient,
     url: &Uri,
     extra: &HeaderMap,
+    idle: std::time::Duration,
 ) -> Result<Response<Incoming>> {
     let mut req = Request::builder()
         .method(Method::GET)
@@ -238,7 +280,7 @@ pub async fn get_full(
         .map_err(|e| Error::InvalidUrl(e.to_string()))?;
     apply_extra(&mut req, extra);
 
-    let resp = client.request(req).await?;
+    let resp = within(idle, "respuesta", client.request(req)).await??;
     if !resp.status().is_success() {
         return Err(Error::Status(resp.status().as_u16()));
     }
@@ -450,7 +492,7 @@ pub async fn get_small(client: &HttpClient, url: &Uri, limit: usize) -> Result<O
         .body(Empty::<Bytes>::new())
         .map_err(|e| Error::InvalidUrl(e.to_string()))?;
 
-    let resp = client.request(req).await?;
+    let resp = within(SMALL_IDLE, "página", client.request(req)).await??;
     let status = resp.status();
     if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
         return Ok(None);
@@ -462,7 +504,7 @@ pub async fn get_small(client: &HttpClient, url: &Uri, limit: usize) -> Result<O
     let content_type = header_string(resp.headers(), hyper::header::CONTENT_TYPE);
     let mut body = resp.into_body();
     let mut buf = bytes::BytesMut::new();
-    while let Some(frame) = body.frame().await {
+    while let Some(frame) = within(SMALL_IDLE, "página", body.frame()).await? {
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
             if buf.len() + data.len() > limit {

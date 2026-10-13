@@ -20,6 +20,9 @@ pub enum Error {
     #[error("cabecera Content-Range inconsistente: {0}")]
     BadContentRange(String),
 
+    #[error("el servidor no envió nada durante {0}")]
+    Timeout(String),
+
     #[error("fragmento truncado: se esperaban {expected} bytes y llegaron {received}")]
     Truncated { expected: u64, received: u64 },
 

@@ -26,6 +26,8 @@ use crate::proxy::ProxyMode;
 pub const DEFAULT_CONNECTIONS: usize = 8;
 pub const DEFAULT_MAX_CHUNK: u64 = 4 << 20;
 const DEFAULT_ATTEMPTS: u32 = 4;
+/// Inactividad máxima por defecto de una conexión.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cada cuántos fragmentos completados se sincroniza el archivo y se persiste el estado.
 const FLUSH_EVERY: usize = 16;
 const HASH_BLOCK: usize = 1 << 20;
@@ -50,6 +52,9 @@ pub struct Options {
     pub headers: HeaderMap,
     /// Bytes completados, actualizado en tiempo real por las tareas de descarga.
     pub progress: Option<Arc<AtomicU64>>,
+    /// Tiempo máximo sin recibir nada del servidor (respuesta o datos) antes de dar el intento por
+    /// fallido y reintentar. Evita que un servidor que se calla deje la descarga colgada.
+    pub idle_timeout: Duration,
     /// Límite de velocidad compartido. El mismo `Arc` en varias descargas reparte un límite global.
     pub limiter: Option<Arc<crate::limits::RateLimiter>>,
 }
@@ -67,6 +72,7 @@ impl Options {
             headers: HeaderMap::new(),
             progress: None,
             limiter: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 }
@@ -117,6 +123,14 @@ impl Control {
         self.0.load(Ordering::SeqCst) == PAUSE
     }
 
+    /// Se resuelve en cuanto se pide pausar o cancelar. Permite interrumpir esperas de red que, de otro modo,
+    /// retrasarían la orden hasta que el servidor volviera a hablar.
+    pub async fn interrupted(&self) {
+        while self.state() == RUN {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub fn is_canceled(&self) -> bool {
         self.0.load(Ordering::SeqCst) == CANCEL
     }
@@ -150,7 +164,12 @@ pub async fn download(opts: Options) -> Result<Report> {
 pub async fn download_controlled(opts: Options, control: Control) -> Result<Outcome> {
     let started = Instant::now();
     let client = net::build_client(opts.connections, &opts.proxy)?;
-    let remote = net::probe(&client, &opts.url, &opts.headers).await?;
+    let remote = tokio::select! {
+        r = net::probe(&client, &opts.url, &opts.headers, opts.idle_timeout) => r?,
+        _ = control.interrupted() => {
+            return Ok(if control.is_canceled() { Outcome::Canceled } else { Outcome::Paused { bytes: 0 } });
+        }
+    };
     let headers = headers_for(&opts.url, &remote.url, &opts.headers);
     let paths = Paths {
         part: with_suffix(&opts.output, ".part"),
@@ -268,6 +287,7 @@ async fn segmented(
         url: remote.url.clone(),
         headers: headers.clone(),
         total,
+        idle: opts.idle_timeout,
         if_range: validators.if_range().map(str::to_owned),
         pending,
         cursor: AtomicUsize::new(0),
@@ -407,6 +427,7 @@ struct Shared {
     headers: HeaderMap,
     /// Tamaño total del recurso: cada fragmento debe declararlo igual.
     total: u64,
+    idle: Duration,
     /// Validador fuerte para `If-Range`.
     if_range: Option<String>,
     pending: Vec<Chunk>,
@@ -674,9 +695,14 @@ async fn run_worker(shared: Arc<Shared>) -> Result<()> {
         // El intento compite con los demás por el mismo fragmento: si otro lo entrega antes, este se abandona.
         let mut lost = flight.done.subscribe();
         let began = Instant::now();
+        // Una pausa o cancelación corta también la espera de red: no hay que esperar a que el servidor hable.
         let fetched = tokio::select! {
             r = fetch_with_retry(&shared, chunk, &flight.received) => Some(r),
             _ = lost.wait_for(|done| *done) => None,
+            _ = shared.control.interrupted() => {
+                shared.end_flight(&flight);
+                return Ok(());
+            }
         };
         let data = match (fetched, &role) {
             (None, _) => continue,
@@ -740,18 +766,19 @@ async fn fetch_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match net::fetch_chunk(
-            &shared.client,
-            &shared.url,
+        let request = net::ChunkRequest {
+            url: &shared.url,
             chunk,
-            shared.if_range.as_deref(),
-            &shared.headers,
-            shared.total,
-            &[&shared.rx_bytes, flight_bytes],
-            shared.limiter.as_deref(),
-        )
-        .await
-        {
+            if_range: shared.if_range.as_deref(),
+            extra: &shared.headers,
+            total: shared.total,
+            idle: shared.idle,
+        };
+        let sinks = net::Sinks {
+            received: &[&shared.rx_bytes, flight_bytes],
+            limiter: shared.limiter.as_deref(),
+        };
+        match net::fetch_chunk(&shared.client, &request, &sinks).await {
             Ok(data) => return Ok(Fetched::Data(data)),
             // Rechazo con otras conexiones sirviendo datos: el servidor quiere menos conexiones.
             // Esperar no ayuda a esta; se devuelve el fragmento y el motor baja el tope.
@@ -800,23 +827,41 @@ async fn single(
     part: &Path,
     control: &Control,
 ) -> Result<Step> {
-    let resp = net::get_full(client, &remote.url, headers).await?;
+    let resp = tokio::select! {
+        r = net::get_full(client, &remote.url, headers, opts.idle_timeout) => r?,
+        _ = control.interrupted() => return Ok(Step::Interrupted { bytes: 0 }),
+    };
     let mut body = resp.into_body();
     let mut file = tokio::fs::File::create(part).await?;
 
     let mut written = 0u64;
-    while let Some(frame) = body.frame().await {
-        if control.state() != RUN {
-            // Sin rangos no hay forma de reanudar: se descarta lo recibido y la próxima vez empieza de cero.
-            drop(file);
-            let _ = tokio::fs::remove_file(part).await;
-            let bytes = if control.state() == CANCEL {
-                0
-            } else {
-                written
-            };
-            return Ok(Step::Interrupted { bytes });
-        }
+    loop {
+        // Cada espera de red compite con el control y con el tiempo máximo de inactividad.
+        let next = tokio::select! {
+            next = tokio::time::timeout(opts.idle_timeout, body.frame()) => Some(next),
+            _ = control.interrupted() => None,
+        };
+        let frame = match next {
+            Some(Ok(Some(frame))) => frame,
+            Some(Ok(None)) => break,
+            Some(Err(_)) => {
+                return Err(Error::Timeout(format!(
+                    "{} s (datos)",
+                    opts.idle_timeout.as_secs_f32()
+                )));
+            }
+            None => {
+                // Sin rangos no hay forma de reanudar: se descarta lo recibido y la próxima vez empieza de cero.
+                drop(file);
+                let _ = tokio::fs::remove_file(part).await;
+                let bytes = if control.state() == CANCEL {
+                    0
+                } else {
+                    written
+                };
+                return Ok(Step::Interrupted { bytes });
+            }
+        };
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
             if let Some(limiter) = &opts.limiter {
@@ -942,7 +987,7 @@ fn is_refusal(e: &Error) -> bool {
 
 fn is_retryable(e: &Error) -> bool {
     match e {
-        Error::Connection(_) | Error::Body(_) | Error::Truncated { .. } => true,
+        Error::Connection(_) | Error::Body(_) | Error::Truncated { .. } | Error::Timeout(_) => true,
         Error::RangeIgnored(s) => *s == 429 || *s >= 500,
         _ => false,
     }
