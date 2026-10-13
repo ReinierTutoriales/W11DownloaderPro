@@ -87,7 +87,6 @@ fn un_segundo_host_funciona_pero_no_guarda_la_cola_y_lo_avisa_una_vez() {
     let dir = tempfile::tempdir().unwrap();
     let mut first = spawn_host(dir.path());
     wait_until_owner(dir.path());
-    let before = std::fs::read(dir.path().join(".w11dl-queue.json")).unwrap();
 
     let mut second = spawn_host(dir.path());
     send(&mut second, r#"{"type":"ping"}"#);
@@ -129,10 +128,8 @@ fn un_segundo_host_funciona_pero_no_guarda_la_cola_y_lo_avisa_una_vez() {
     drop(first.stdin.take());
     assert!(first.wait().unwrap().success());
     let after = std::fs::read(dir.path().join(".w11dl-queue.json")).unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&after).contains("a.zip"),
-        false,
+    assert!(
+        !String::from_utf8_lossy(&after).contains("a.zip"),
         "el segundo host no debe haber escrito su cola"
     );
-    let _ = before;
 }
