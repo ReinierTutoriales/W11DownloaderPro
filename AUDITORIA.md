@@ -200,6 +200,13 @@ Ronda 8 (contabilidad del avance en las pistas descartadas):
 |---|---|---|
 | El avance contaba también los bytes de las pistas descartadas y vueltas a bajar (una pista de 10 MiB descartada y repetida aportaba 20 MiB), y `Report.downloaded` omitía lo descartado | Cada pista lleva su propio contador de bytes válidos; el avance visible es su suma. Al descartar una pista, sus bytes salen del avance y se acumulan como tráfico gastado, que se suma a `Report.downloaded`. Así el avance no se infla y el tráfico real de red no se oculta | `una_pista_descartada_no_infla_el_avance_y_si_cuenta_como_trafico` (avance 50 000 B válidos, tráfico 80 000 B). **Mutación:** sin descontar lo descartado, falla |
 
+Revisión del paquete de la CI de 0e3fa8e (descargado y comprobado fuera de la CI):
+
+- El `.zip` coincide con su `.sha256` adjunto y con el resumen (`digest`) que GitHub registra del artefacto; `SHA256SUMS.txt` valida los 19 archivos; el hash de `yt-dlp.exe` coincide con `packaging/third-party.json`. El de `ffmpeg.exe` no se puede contrastar fuera de la CI (el hash fijado es el del zip de BtbN, comprobado al empaquetar).
+- Contiene `w11dl.exe`, `w11dl-host.exe` (PE32+ x86-64), extensión, `tools/` (yt-dlp, ffmpeg, ffprobe, licencia de FFmpeg), avisos y guía de prueba.
+- Observaciones: ese paquete se identificaba como 0.0.1 (cambiado a 0.0.2 y protegido con `tests/version.rs`); no incluye archivo de licencia del proyecto (pendiente de decisión); el inventario de licencias de las dependencias de Rust sigue sin generarse; los ejecutables no están firmados.
+- Un binario de Windows no se puede ejecutar en este entorno: su ejecución real es la de la CI y la prueba de escritorio.
+
 Corrección de una afirmación anterior: la prueba de cicloCorrección de una afirmación anterior: la prueba de ciclo no pasa por el adjudicador de nombres del host (ambas descargas usan el mismo destino), y `procesos.rs` no cubría dos descargas compitiendo durante el hash y la publicación; ahora lo cubren `ciclo.rs` (mismo proceso, determinista) y el bloqueo exclusivo del sistema operativo.
 
 Pendiente de verificar: el comportamiento de estos bloqueos y de `RestartOnFailure` en la CI y en un Windows 11 de escritorio.

@@ -1,4 +1,4 @@
-W11DownloaderPro 0.0.1 — VERSIÓN DE PRUEBAS
+W11DownloaderPro 0.0.2 — VERSIÓN DE PRUEBAS
 ==========================================
 
 Esto es una versión de pruebas, no estable y sin firmar. Se ha verificado con pruebas automáticas
@@ -32,6 +32,9 @@ Instalación
      elige  extension\manifest.json
      El complemento temporal se quita al cerrar Firefox; hay que cargarlo de nuevo cada vez.
   4. Las descargas se guardan en tu carpeta Descargas (%USERPROFILE%\Downloads).
+     Junto a lo descargado se crea una carpeta oculta .w11dl-locks con archivos .lock vacíos: son la
+     exclusión que impide que dos descargas usen el mismo destino. Es normal; no la borres mientras
+     haya descargas en curso.
 
 Qué probar (y qué contarme)
 ---------------------------
@@ -43,7 +46,12 @@ Qué probar (y qué contarme)
      Prueba una página con un .mp4 directo, YouTube y otro sitio. Anota cuáles funcionan.
   5. Pantalla completa: ¿el botón sigue visible?
   6. Reanudar: pausa una descarga grande y reanúdala. Cierra Firefox a mitad y comprueba qué pasa.
-  7. Si el host no responde, la descarga debe quedar en Firefox (respaldo). Cuéntame si pasa.
+  7. Vídeo con imagen y sonido separados (p. ej. YouTube): pausa y cancela también mientras «une»; tras
+     cancelar no deben quedar archivos .video, .audio ni .merging. Cierra Firefox con una descarga de
+     vídeo pausada, ábrelo y reanúdala: o termina con sonido, o falla con un mensaje (nunca un vídeo mudo).
+  8. Dos pestañas/ventanas de Firefox con la extensión: el segundo host no debe poder cancelar ni
+     pausar lo del primero, y avisa de que no guarda la cola.
+  9. Si el host no responde, la descarga debe quedar en Firefox (respaldo). Cuéntame si pasa.
   Para cada fallo: la acción, el sitio, el mensaje exacto y la versión de Firefox. Para el rendimiento:
   define  W11DL_TRACE=1  y ejecuta  .\w11dl.exe <url> -c 8  desde PowerShell; copia las líneas [trace].
 
