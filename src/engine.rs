@@ -215,6 +215,9 @@ pub async fn download_controlled(opts: Options, control: Control) -> Result<Outc
 /// el mismo enlace que no haya cambiado.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
+    /// URL final tras redirecciones. Un `ETag` solo identifica una representación dentro de su propio
+    /// recurso (RFC 9110): el mismo tamaño y `ETag` en otra URL no demuestran el mismo contenido.
+    pub url: String,
     pub total: u64,
     pub validator: String,
 }
@@ -238,7 +241,11 @@ pub async fn identify(opts: &Options) -> Result<Option<Identity>> {
         _ => None,
     };
     Ok(match (remote.total, validator) {
-        (Some(total), Some(validator)) => Some(Identity { total, validator }),
+        (Some(total), Some(validator)) => Some(Identity {
+            url: remote.url.to_string(),
+            total,
+            validator,
+        }),
         _ => None,
     })
 }
@@ -332,8 +339,10 @@ async fn run_locked(
 
     let (part, state_path) = (&paths.part, &paths.state);
     if let Some(expected) = &opts.sha256 {
-        // Se lee por el mismo manejador que escribió el parcial.
-        let actual = sha256_of(lock).await?;
+        // Se lee por el mismo manejador que escribió el parcial; la verificación atiende el control.
+        let Some(actual) = sha256_of(lock, control).await? else {
+            return stopped_before_publish(control, paths, transfer.bytes).await;
+        };
         if !actual.eq_ignore_ascii_case(expected) {
             let _ = tokio::fs::remove_file(part).await;
             let _ = tokio::fs::remove_file(state_path).await;
@@ -344,6 +353,11 @@ async fn run_locked(
         }
     }
 
+    // Una pausa o cancelación que llegó durante la verificación (o justo después) se respeta antes de
+    // publicar: nunca se devuelve «completado» una descarga que el usuario ya canceló.
+    if control.is_interrupted() {
+        return stopped_before_publish(control, paths, transfer.bytes).await;
+    }
     tokio::fs::rename(part, &opts.output).await?;
     remove_if_exists(state_path).await?;
 
@@ -1181,13 +1195,30 @@ fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
-async fn sha256_of(file: &Arc<File>) -> Result<String> {
+/// Interrupción antes de publicar, con la exclusión tomada: cancelar limpia (y comunica los fallos de
+/// borrado); pausar conserva el parcial y su estado para terminar la verificación al reanudar.
+async fn stopped_before_publish(control: &Control, paths: &Paths, bytes: u64) -> Result<Outcome> {
+    if control.is_canceled() {
+        remove_if_exists(&paths.part).await?;
+        remove_if_exists(&paths.state).await?;
+        Ok(Outcome::Canceled)
+    } else {
+        Ok(Outcome::Paused { bytes })
+    }
+}
+
+/// SHA-256 del parcial. `None` si se pidió pausar o cancelar mientras se calculaba.
+async fn sha256_of(file: &Arc<File>, control: &Control) -> Result<Option<String>> {
     let file = Arc::clone(file);
-    tokio::task::spawn_blocking(move || -> io::Result<String> {
+    let control = control.clone();
+    tokio::task::spawn_blocking(move || -> io::Result<Option<String>> {
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; HASH_BLOCK];
         let mut offset = 0u64;
         loop {
+            if control.is_interrupted() {
+                return Ok(None);
+            }
             let n = read_at(&file, &mut buf, offset)?;
             if n == 0 {
                 break;
@@ -1195,11 +1226,13 @@ async fn sha256_of(file: &Arc<File>) -> Result<String> {
             hasher.update(&buf[..n]);
             offset += n as u64;
         }
-        Ok(hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect())
+        Ok(Some(
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        ))
     })
     .await
     .map_err(io::Error::other)?

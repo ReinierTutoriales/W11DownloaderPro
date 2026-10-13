@@ -255,14 +255,37 @@ async fn read_manifest(track: &Path) -> Option<engine::Identity> {
     serde_json::from_slice(&text).ok()
 }
 
+/// Consulta la identidad compitiendo con el control: `None` si se pidió pausar o cancelar mientras
+/// esperaba al servidor (una consulta que se calla no retrasa las órdenes del usuario).
+async fn identify_or_stop(opts: &Options, control: &Control) -> Option<Option<engine::Identity>> {
+    tokio::select! {
+        r = engine::identify(opts) => Some(r.ok().flatten()),
+        _ = control.interrupted() => None,
+    }
+}
+
+fn stopped(control: &Control) -> Outcome {
+    if control.is_canceled() {
+        Outcome::Canceled
+    } else {
+        Outcome::Paused { bytes: 0 }
+    }
+}
+
 /// Descarga una pista. Una pista completa de una ejecución anterior solo se reutiliza si su
-/// manifiesto coincide con la identidad actual del recurso (mismo tamaño y mismo validador fuerte); si
-/// no puede comprobarse, se vuelve a descargar. Reutilizarla a ciegas podría unir pistas de
-/// selecciones o contenidos distintos.
+/// manifiesto coincide con la identidad actual del recurso (misma URL final, mismo tamaño y mismo
+/// validador fuerte); si no puede comprobarse, se vuelve a descargar. Reutilizarla a ciegas podría unir
+/// pistas de selecciones o contenidos distintos. Todas las esperas atienden pausa y cancelación, y el
+/// control se comprueba antes de borrar, reutilizar o certificar.
 async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
     if let Ok(meta) = tokio::fs::metadata(&opts.output).await {
         let saved = read_manifest(&opts.output).await;
-        let now = engine::identify(&opts).await.ok().flatten();
+        let Some(now) = identify_or_stop(&opts, &control).await else {
+            return Ok(stopped(&control));
+        };
+        if control.is_interrupted() {
+            return Ok(stopped(&control));
+        }
         let reusable =
             matches!((&saved, &now), (Some(a), Some(b)) if a == b && a.total == meta.len());
         if reusable {
@@ -281,11 +304,21 @@ async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
     }
     engine::remove_if_exists(&manifest_of(&opts.output)).await?;
 
-    let before = engine::identify(&opts).await.ok().flatten();
-    let outcome = engine::download_controlled(opts.clone(), control).await?;
-    if let (Outcome::Completed(_), Some(before)) = (&outcome, before) {
+    let Some(before) = identify_or_stop(&opts, &control).await else {
+        return Ok(stopped(&control));
+    };
+    let outcome = engine::download_controlled(opts.clone(), control.clone()).await?;
+    if let (Outcome::Completed(report), Some(before)) = (&outcome, before) {
         // Solo se certifica si el recurso sigue siendo el mismo después de bajarlo.
-        if engine::identify(&opts).await.ok().flatten().as_ref() == Some(&before) {
+        let Some(after) = identify_or_stop(&opts, &control).await else {
+            return Ok(match stopped(&control) {
+                Outcome::Paused { .. } => Outcome::Paused {
+                    bytes: report.bytes,
+                },
+                other => other,
+            });
+        };
+        if after.as_ref() == Some(&before) && !control.is_interrupted() {
             write_manifest(&opts.output, &before).await?;
         }
     }

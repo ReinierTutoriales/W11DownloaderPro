@@ -176,6 +176,14 @@ Ronda 5 (revisión de 4b45d83):
 | Una pausa recibida al terminar ffmpeg podía publicar | Se comprueba cualquier interrupción antes de publicar: pausar retira el temporal, conserva las pistas y devuelve `Paused`; cancelar borra todo. Barrera `test-hooks` entre el fin de ffmpeg y la publicación | `una_pausa_que_llega_al_terminar_la_union_no_publica`. **Mutación:** comprobando solo la cancelación falla |
 | `abandon_single` confirmaba una cancelación con el parcial sin borrar | Devuelve `Result<Step>` y propaga el error de borrado (con la exclusión tomada) | cubierto por la ruta de limpieza; sin prueba específica de fallo de borrado en el modo sin rangos (pendiente) |
 
+Ronda 6 (revisión de c07cb64):
+
+| Hallazgo | Corrección | Prueba |
+|---|---|---|
+| Tamaño + `ETag` no identifica recursos distintos (RFC 9110: un validador solo vale dentro de su recurso) | La identidad incluye la URL final tras redirecciones además del tamaño y el validador fuerte. Coste asumido: con enlaces firmados que cambian de URL, una pista completa tras reiniciar se vuelve a bajar (seguro antes que rápido); reutilizar entre enlaces distintos exigiría una identidad verificable del contenido, que HTTP no da | `mismo_tamano_y_mismo_etag_en_otro_recurso_no_es_la_misma_pista` (dos recursos, igual longitud y mismo `ETag`). **Mutación:** sin la URL falla |
+| Las consultas de identidad no atendían pausa ni cancelación | Cada consulta compite con `Control::interrupted()` y el control se comprueba antes de borrar, reutilizar o certificar una pista | `pausar_y_cancelar_atienden_la_consulta_de_identidad_aunque_el_servidor_calle` (servidor mudo). **Mutación:** consulta sin control, falla. La consulta posterior a completar una pista usa la misma función pero no tiene prueba propia |
+| La descarga directa publicaba tras cancelar durante la verificación | El cálculo del SHA-256 consulta el control en cada bloque y se comprueba otra vez antes del renombrado: cancelar limpia bajo la exclusión (errores comunicados), pausar conserva parcial y estado y al reanudar publica sin volver a bajar | `cancelar_al_terminar_la_transferencia…` y `pausar_al_terminar_la_transferencia…`, con y sin hash. **Mutación:** sin las comprobaciones fallan ambas |
+
 Corrección de una afirmación anterior: la prueba de cicloCorrección de una afirmación anterior: la prueba de ciclo no pasa por el adjudicador de nombres del host (ambas descargas usan el mismo destino), y `procesos.rs` no cubría dos descargas compitiendo durante el hash y la publicación; ahora lo cubren `ciclo.rs` (mismo proceso, determinista) y el bloqueo exclusivo del sistema operativo.
 
 Pendiente de verificar: el comportamiento de estos bloqueos y de `RestartOnFailure` en la CI y en un Windows 11 de escritorio.

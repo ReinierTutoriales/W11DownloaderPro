@@ -300,7 +300,7 @@ async fn una_pista_completa_sin_manifiesto_o_con_otro_tamano_no_se_reutiliza() {
     let video = payload(200_000);
     // Una pista terminada de quién sabe qué selección, sin manifiesto: no se puede comprobar.
     std::fs::write(dir.path().join("final.mp4.video"), b"otra cosa").unwrap();
-    // Otra con manifiesto de un recurso de distinto tamaño.
+    // Otra con un manifiesto ilegible (de una versión anterior).
     std::fs::write(dir.path().join("final.mp4.audio"), vec![1u8; 50_000]).unwrap();
     std::fs::write(
         dir.path().join("final.mp4.audio.done"),
@@ -424,4 +424,114 @@ async fn el_archivo_de_exclusion_es_estable_y_borrar_parciales_no_pisa_una_desca
     let lock = dir.path().join(".w11dl-locks").join("f.bin.lock");
     assert!(lock.exists(), "el archivo de exclusión es persistente");
     assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0);
+}
+
+fn plain_job(addr: std::net::SocketAddr, video_path: &str, ffmpeg: PathBuf) -> MergeJob {
+    let mut j = job(addr, ffmpeg);
+    j.video.url = format!("http://{addr}{video_path}");
+    j
+}
+
+#[tokio::test]
+async fn mismo_tamano_y_mismo_etag_en_otro_recurso_no_es_la_misma_pista() {
+    // Dos recursos distintos, igual longitud y el mismo ETag («v1» en este servidor de pruebas).
+    let (a, b) = (
+        payload(120_000),
+        payload(120_000).into_iter().rev().collect::<Vec<u8>>(),
+    );
+    assert_ne!(a, b);
+    let (addr, _site) = serve(vec![
+        ("/v.mp4", "video/mp4", a.clone()),
+        ("/w.mp4", "video/mp4", b.clone()),
+        ("/a.m4a", "audio/mp4", payload(50_000)),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("final.mp4");
+    let ffmpeg = hanging_ffmpeg(dir.path());
+    let marker = dir.path().join("ffmpeg-arranco");
+
+    let control = Control::default();
+    let first = tokio::spawn(download_merged(
+        Options::new("ignorada", &out),
+        plain_job(addr, "/v.mp4", ffmpeg.clone()),
+        control.clone(),
+    ));
+    wait_for(&marker).await;
+    control.pause();
+    let outcome = first.await.unwrap().unwrap();
+    assert!(matches!(outcome, Outcome::Paused { .. }), "{outcome:?}");
+    assert_eq!(
+        std::fs::read(dir.path().join("final.mp4.video")).unwrap(),
+        a
+    );
+    assert!(dir.path().join("final.mp4.video.done").exists());
+
+    // Mismo destino, pero ahora la imagen seleccionada es otro recurso.
+    std::fs::remove_file(&marker).unwrap();
+    let control = Control::default();
+    let second = tokio::spawn(download_merged(
+        Options::new("ignorada", &out),
+        plain_job(addr, "/w.mp4", ffmpeg),
+        control.clone(),
+    ));
+    wait_for(&marker).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("final.mp4.video")).unwrap(),
+        b,
+        "se reutilizó la imagen de otro recurso con el mismo tamaño y ETag"
+    );
+    control.cancel();
+    let _ = second.await;
+}
+
+/// Servidor que acepta conexiones y no responde nunca.
+async fn silent_server() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn pausar_y_cancelar_atienden_la_consulta_de_identidad_aunque_el_servidor_calle() {
+    for cancel in [true, false] {
+        let addr = silent_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("final.mp4");
+        // Pistas completas de una ejecución anterior: hay que consultar al servidor para reutilizarlas.
+        std::fs::write(dir.path().join("final.mp4.video"), b"video").unwrap();
+        std::fs::write(dir.path().join("final.mp4.audio"), b"audio").unwrap();
+        let control = Control::default();
+        let handle = tokio::spawn(download_merged(
+            Options::new("ignorada", &out),
+            job(addr, "ffmpeg-inexistente".into()),
+            control.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t = Instant::now();
+        if cancel {
+            control.cancel();
+        } else {
+            control.pause();
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("la orden debe atenderse sin esperar al servidor")
+            .unwrap()
+            .unwrap();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        if cancel {
+            assert!(matches!(outcome, Outcome::Canceled), "{outcome:?}");
+            assert!(!dir.path().join("final.mp4.video").exists());
+        } else {
+            assert!(matches!(outcome, Outcome::Paused { .. }), "{outcome:?}");
+            assert!(dir.path().join("final.mp4.video").exists());
+        }
+    }
 }

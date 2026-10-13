@@ -226,3 +226,74 @@ async fn cancelar_una_descarga_rechazada_por_estar_ocupada_no_borra_lo_de_la_otr
         .expect("la primera sigue y termina bien");
     assert!(std::fs::read(&out).unwrap() == data);
 }
+
+/// Descarga hasta la barrera previa a la verificación y devuelve el control y la tarea.
+async fn stopped_at_gate(
+    dir: &std::path::Path,
+    sha: bool,
+) -> (
+    Control,
+    Arc<Gate>,
+    tokio::task::JoinHandle<w11dl::Result<Outcome>>,
+    Vec<u8>,
+    std::net::SocketAddr,
+) {
+    let data = ranged::payload(4 << 20);
+    let addr = ranged::ranged(Arc::new(data.clone()), Duration::ZERO, 0, 1).await;
+    let mut opts = Options::new(format!("http://{addr}/f.bin"), dir.join("f.bin"));
+    opts.connections = 4;
+    opts.max_chunk = 1 << 20;
+    if sha {
+        opts.sha256 = Some(sha256_hex(&data));
+    }
+    let gate = Arc::new(Gate::default());
+    opts.gate = Some(Arc::clone(&gate));
+    let control = Control::default();
+    let handle = tokio::spawn(download_controlled(opts, control.clone()));
+    gate.reached.acquire().await.unwrap().forget();
+    (control, gate, handle, data, addr)
+}
+
+#[tokio::test]
+async fn cancelar_al_terminar_la_transferencia_no_publica_ni_con_hash_ni_sin_el() {
+    for sha in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (control, gate, handle, _data, _addr) = stopped_at_gate(dir.path(), sha).await;
+        control.cancel();
+        gate.release.add_permits(1);
+        let outcome = handle.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, Outcome::Canceled),
+            "sha={sha}: {outcome:?}"
+        );
+        assert!(!dir.path().join("f.bin").exists(), "sha={sha}: se publicó");
+        assert!(!dir.path().join("f.bin.part").exists());
+        assert!(!dir.path().join("f.bin.part.state").exists());
+    }
+}
+
+#[tokio::test]
+async fn pausar_al_terminar_la_transferencia_conserva_el_progreso_y_al_reanudar_publica() {
+    for sha in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (control, gate, handle, data, addr) = stopped_at_gate(dir.path(), sha).await;
+        control.pause();
+        gate.release.add_permits(1);
+        let outcome = handle.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, Outcome::Paused { .. }),
+            "sha={sha}: {outcome:?}"
+        );
+        assert!(!dir.path().join("f.bin").exists(), "sha={sha}: se publicó");
+        assert!(dir.path().join("f.bin.part").exists());
+
+        // Al reanudar no se baja nada y se publica.
+        let mut opts = Options::new(format!("http://{addr}/f.bin"), dir.path().join("f.bin"));
+        opts.connections = 4;
+        opts.max_chunk = 1 << 20;
+        opts.sha256 = Some(sha256_hex(&data));
+        let report = download(opts).await.unwrap();
+        assert_eq!(report.downloaded, 0, "sha={sha}: {report:?}");
+        assert!(std::fs::read(dir.path().join("f.bin")).unwrap() == data);
+    }
+}
