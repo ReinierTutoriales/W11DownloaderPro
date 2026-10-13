@@ -162,25 +162,58 @@ pub async fn download(opts: Options) -> Result<Report> {
 }
 
 pub async fn download_controlled(opts: Options, control: Control) -> Result<Outcome> {
+    let paths = Paths {
+        part: with_suffix(&opts.output, ".part"),
+        state: with_suffix(&opts.output, ".part.state"),
+    };
+    // Dueño exclusivo del destino durante TODO el ciclo: comprobar el estado, transferir, verificar,
+    // publicar y limpiar. Quien llegue después recibe `Busy` sin tocar ningún archivo.
+    let lock = Arc::new(open_locked(&paths.part).await?);
+    let result = run_locked(&opts, &control, &paths, &lock).await;
+    if !matches!(result, Ok(Outcome::Completed(_))) {
+        // Una descarga que no llegó a escribir nada no deja un parcial vacío suelto.
+        let empty = lock.metadata().map(|m| m.len() == 0).unwrap_or(false);
+        if empty && !paths.state.exists() {
+            let _ = tokio::fs::remove_file(&paths.part).await;
+        }
+    }
+    result
+}
+
+async fn run_locked(
+    opts: &Options,
+    control: &Control,
+    paths: &Paths,
+    lock: &Arc<File>,
+) -> Result<Outcome> {
     let started = Instant::now();
     let client = net::build_client(opts.connections, &opts.proxy)?;
     let remote = tokio::select! {
         r = net::probe(&client, &opts.url, &opts.headers, opts.idle_timeout) => r?,
         _ = control.interrupted() => {
-            return Ok(if control.is_canceled() { Outcome::Canceled } else { Outcome::Paused { bytes: 0 } });
+            // Somos los dueños del destino: cancelar limpia lo de una ejecución anterior; pausar lo conserva.
+            if control.is_canceled() {
+                let _ = tokio::fs::remove_file(&paths.part).await;
+                let _ = tokio::fs::remove_file(&paths.state).await;
+                return Ok(Outcome::Canceled);
+            }
+            return Ok(Outcome::Paused { bytes: 0 });
         }
     };
     let headers = headers_for(&opts.url, &remote.url, &opts.headers);
-    let paths = Paths {
-        part: with_suffix(&opts.output, ".part"),
-        state: with_suffix(&opts.output, ".part.state"),
-    };
 
+    let session = Session {
+        client: &client,
+        opts,
+        remote: &remote,
+        headers: &headers,
+        control,
+        paths,
+        lock,
+    };
     let step = match (remote.ranges, remote.total) {
-        (true, Some(total)) if total > 0 => {
-            segmented(&client, &opts, &remote, &headers, total, &paths, &control).await?
-        }
-        _ => single(&client, &opts, &remote, &headers, &paths.part, &control).await?,
+        (true, Some(total)) if total > 0 => segmented(&session, total).await?,
+        _ => single(&session).await?,
     };
     let transfer = match step {
         Step::Finished(transfer) => transfer,
@@ -195,7 +228,9 @@ pub async fn download_controlled(opts: Options, control: Control) -> Result<Outc
 
     let (part, state_path) = (&paths.part, &paths.state);
     if let Some(expected) = &opts.sha256 {
-        let actual = sha256_of(part).await?;
+        // Se lee por el mismo manejador que tiene el bloqueo: en Windows el bloqueo es obligatorio y
+        // cualquier otro manejador no podría leer el parcial mientras lo conservamos.
+        let actual = sha256_of(lock).await?;
         if !actual.eq_ignore_ascii_case(expected) {
             let _ = tokio::fs::remove_file(part).await;
             let _ = tokio::fs::remove_file(state_path).await;
@@ -237,15 +272,28 @@ struct Paths {
     state: PathBuf,
 }
 
-async fn segmented(
-    client: &HttpClient,
-    opts: &Options,
-    remote: &Remote,
-    headers: &HeaderMap,
-    total: u64,
-    paths: &Paths,
-    control: &Control,
-) -> Result<Step> {
+/// Lo que comparten las dos formas de transferir durante una descarga: red, ajustes y destino bloqueado.
+struct Session<'a> {
+    client: &'a HttpClient,
+    opts: &'a Options,
+    remote: &'a Remote,
+    headers: &'a HeaderMap,
+    control: &'a Control,
+    paths: &'a Paths,
+    /// Manejador del parcial que tiene el bloqueo exclusivo.
+    lock: &'a Arc<File>,
+}
+
+async fn segmented(session: &Session<'_>, total: u64) -> Result<Step> {
+    let Session {
+        client,
+        opts,
+        remote,
+        headers,
+        control,
+        paths,
+        lock: file,
+    } = *session;
     let (part, state_path) = (paths.part.as_path(), paths.state.as_path());
     let url = remote.url.to_string();
     let chunk_size = plan::effective_chunk_size(total, opts.connections, opts.max_chunk);
@@ -256,7 +304,8 @@ async fn segmented(
         remote.date.as_deref(),
     );
     // El parcial se crea con la longitud final: si no la tiene, perdió datos que el estado da por buenos.
-    let part_len = tokio::fs::metadata(part).await.map(|m| m.len()).ok();
+    // Se mide con el bloqueo ya tomado: nadie puede cambiarlo entre comprobar y usar.
+    let part_len = file.metadata().map(|m| m.len()).ok();
     let resumable = load_state(state_path)
         .await
         .filter(|s| {
@@ -270,7 +319,10 @@ async fn segmented(
     let fresh = resumable.is_none();
     let state =
         resumable.unwrap_or_else(|| State::new(&url, total, chunk_size, validators.clone()));
-    let file = Arc::new(open_part(part, fresh, total).await?);
+    if fresh {
+        resize_part(file, total).await?;
+    }
+    let file = Arc::clone(file);
 
     let resumed = state.completed_bytes();
     if let Some(p) = &opts.progress {
@@ -836,35 +888,43 @@ async fn checkpoint(shared: &Shared) -> Result<()> {
     write_state_atomic(&shared.state_path, &snapshot).await
 }
 
-async fn single(
-    client: &HttpClient,
-    opts: &Options,
-    remote: &Remote,
-    headers: &HeaderMap,
+/// Sin rangos no hay forma de reanudar: se descarta lo recibido y la próxima vez empieza de cero.
+async fn abandon_single(
+    file: tokio::fs::File,
     part: &Path,
     control: &Control,
-) -> Result<Step> {
+    written: u64,
+) -> Step {
+    drop(file);
+    let _ = tokio::fs::remove_file(part).await;
+    let bytes = if control.state() == CANCEL {
+        0
+    } else {
+        written
+    };
+    Step::Interrupted { bytes }
+}
+
+async fn single(session: &Session<'_>) -> Result<Step> {
+    let Session {
+        client,
+        opts,
+        remote,
+        headers,
+        control,
+        paths,
+        lock,
+    } = *session;
+    let part = paths.part.as_path();
     let resp = tokio::select! {
         r = net::get_full(client, &remote.url, headers, opts.idle_timeout) => r?,
         _ = control.interrupted() => return Ok(Step::Interrupted { bytes: 0 }),
     };
     let mut body = resp.into_body();
-    let mut file = {
-        let part = part.to_path_buf();
-        let std_file = tokio::task::spawn_blocking(move || -> Result<File> {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&part)?;
-            lock_exclusive(&file, &part)?;
-            file.set_len(0)?;
-            Ok(file)
-        })
-        .await
-        .map_err(io::Error::other)??;
-        tokio::fs::File::from_std(std_file)
-    };
+    // Sin rangos no se reanuda: se empieza de cero. Se escribe por una copia del mismo manejador que
+    // tiene el bloqueo, así la exclusión no se pierde en ningún momento.
+    resize_part(lock, 0).await?;
+    let mut file = tokio::fs::File::from_std(lock.try_clone()?);
 
     let mut written = 0u64;
     loop {
@@ -882,22 +942,18 @@ async fn single(
                     opts.idle_timeout.as_secs_f32()
                 )));
             }
-            None => {
-                // Sin rangos no hay forma de reanudar: se descarta lo recibido y la próxima vez empieza de cero.
-                drop(file);
-                let _ = tokio::fs::remove_file(part).await;
-                let bytes = if control.state() == CANCEL {
-                    0
-                } else {
-                    written
-                };
-                return Ok(Step::Interrupted { bytes });
-            }
+            None => return Ok(abandon_single(file, part, control, written).await),
         };
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
             if let Some(limiter) = &opts.limiter {
-                limiter.throttle(data.len() as u64).await;
+                // Con un límite bajo la espera puede ser larga: pausar o cancelar la corta igualmente.
+                tokio::select! {
+                    () = limiter.throttle(data.len() as u64) => {}
+                    () = control.interrupted() => {
+                        return Ok(abandon_single(file, part, control, written).await);
+                    }
+                }
             }
             file.write_all(&data).await?;
             written += data.len() as u64;
@@ -926,10 +982,10 @@ async fn single(
 }
 
 /// Abre el parcial con bloqueo exclusivo del sistema, que se mantiene mientras viva el manejador (y
-/// desaparece solo si el proceso muere). Dos descargas a la misma ruta no pueden escribir a la vez:
-/// la segunda recibe `Error::Busy` sin tocar el archivo. Solo se trunca o redimensiona con el bloqueo ya
-/// tomado, para no destrozar el parcial de otra descarga en curso.
-async fn open_part(part: &Path, fresh: bool, total: u64) -> Result<File> {
+/// desaparece solo si el proceso muere). Dos descargas a la misma ruta no pueden escribir a la vez: la
+/// segunda recibe `Error::Busy` sin tocar el archivo. No se trunca ni se redimensiona aquí: eso solo
+/// se hace con el bloqueo tomado y después de validar el estado.
+async fn open_locked(part: &Path) -> Result<File> {
     let part = part.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let file = OpenOptions::new()
@@ -939,11 +995,18 @@ async fn open_part(part: &Path, fresh: bool, total: u64) -> Result<File> {
             .truncate(false)
             .open(&part)?;
         lock_exclusive(&file, &part)?;
-        if fresh {
-            file.set_len(0)?;
-            file.set_len(total)?;
-        }
         Ok(file)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Deja el parcial vacío y con la longitud final.
+async fn resize_part(file: &Arc<File>, total: u64) -> io::Result<()> {
+    let file = Arc::clone(file);
+    tokio::task::spawn_blocking(move || {
+        file.set_len(0)?;
+        file.set_len(total)
     })
     .await
     .map_err(io::Error::other)?
@@ -980,19 +1043,19 @@ fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
-async fn sha256_of(path: &Path) -> Result<String> {
-    let path = path.to_path_buf();
+async fn sha256_of(file: &Arc<File>) -> Result<String> {
+    let file = Arc::clone(file);
     tokio::task::spawn_blocking(move || -> io::Result<String> {
-        use std::io::Read;
-        let mut file = File::open(&path)?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; HASH_BLOCK];
+        let mut offset = 0u64;
         loop {
-            let n = file.read(&mut buf)?;
+            let n = read_at(&file, &mut buf, offset)?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
+            offset += n as u64;
         }
         Ok(hasher
             .finalize()
@@ -1003,6 +1066,19 @@ async fn sha256_of(path: &Path) -> Result<String> {
     .await
     .map_err(io::Error::other)?
     .map_err(Error::from)
+}
+
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
 }
 
 async fn load_state(path: &Path) -> Option<State> {
