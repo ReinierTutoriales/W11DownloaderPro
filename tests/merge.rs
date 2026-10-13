@@ -131,6 +131,7 @@ async fn cancelar_no_deja_archivos_y_un_fallo_de_union_conserva_las_pistas() {
     // Datos que no son un vídeo: la descarga termina, la unión falla.
     let (addr, _site) = serve(vec![
         ("/v.mp4", "video/mp4", vec![7u8; 4096]),
+        ("/w.mp4", "video/mp4", v.clone()),
         ("/a.m4a", "audio/mp4", a.clone()),
     ])
     .await;
@@ -150,14 +151,11 @@ async fn cancelar_no_deja_archivos_y_un_fallo_de_union_conserva_las_pistas() {
         "las pistas completas quedan certificadas por un manifiesto"
     );
 
-    // Reintento contra un recurso cuyo vídeo cambió: la pista de sonido sigue siendo la misma
-    // (mismo tamaño y validador) y se reutiliza; la de imagen ya no coincide y se vuelve a bajar.
-    let (addr2, _site2) = serve(vec![
-        ("/v.mp4", "video/mp4", v.clone()),
-        ("/a.m4a", "audio/mp4", a.clone()),
-    ])
-    .await;
-    let outcome = download_merged(Options::new("x", &out), job(addr2), Control::default())
+    // Reintento eligiendo otra imagen en el mismo sitio: el sonido sigue siendo el mismo recurso (misma
+    // URL, tamaño y validador) y se reutiliza; la imagen ya no coincide y se vuelve a bajar.
+    let mut retry = job(addr);
+    retry.video.url = format!("http://{addr}/w.mp4");
+    let outcome = download_merged(Options::new("x", &out), retry, Control::default())
         .await
         .unwrap();
     let Outcome::Completed(report) = outcome else {
