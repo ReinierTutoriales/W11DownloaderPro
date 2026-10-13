@@ -7,7 +7,6 @@ mod ranged;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -19,7 +18,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use w11dl::engine::{Control, Outcome, download_controlled};
+use w11dl::engine::{Control, Gate, Outcome, download_controlled};
 use w11dl::limits::RateLimiter;
 use w11dl::{Error, Options, download};
 
@@ -32,59 +31,48 @@ fn sha256_hex(data: &[u8]) -> String {
 
 #[tokio::test]
 async fn una_segunda_descarga_no_entra_mientras_la_primera_verifica_y_publica() {
-    // 96 MiB: en una compilación de depuración, calcular el hash tarda varios segundos, ventana de sobra.
-    let data = ranged::payload(96 << 20);
+    let data = ranged::payload(8 << 20);
     let addr = ranged::ranged(Arc::new(data.clone()), Duration::ZERO, 0, 1).await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("grande.bin");
-    let progress = Arc::new(AtomicU64::new(0));
-    let make = |progress: Option<Arc<AtomicU64>>| {
+    // El hash esperado se calcula una vez y las dos opciones se preparan antes de arrancar nada.
+    let expected = sha256_hex(&data);
+    let make = || {
         let mut opts = Options::new(format!("http://{addr}/f.bin"), out.clone());
-        opts.connections = 8;
-        opts.max_chunk = 4 << 20;
-        opts.sha256 = Some(sha256_hex(&data));
-        opts.progress = progress;
+        opts.connections = 4;
+        opts.max_chunk = 1 << 20;
+        opts.sha256 = Some(expected.clone());
         opts
     };
+    let gate = Arc::new(Gate::default());
+    let mut first_opts = make();
+    first_opts.gate = Some(Arc::clone(&gate));
+    let second_opts = make();
 
-    // Instante en que la primera termina (publica), para juzgar si la segunda coincidió con ella.
-    let first_done: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
-    let done = Arc::clone(&first_done);
-    let first_opts = make(Some(Arc::clone(&progress)));
-    let first = tokio::spawn(async move {
-        let result = download(first_opts).await;
-        *done.lock().unwrap() = Some(Instant::now());
-        result
-    });
-    // Esperar a que termine la transferencia: a partir de aquí la primera solo verifica y publica.
-    let total = data.len() as u64;
-    let began = Instant::now();
-    while progress.load(Ordering::Relaxed) < total {
-        assert!(
-            began.elapsed() < Duration::from_secs(60),
-            "la primera no terminó de transferir"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let second_start = Instant::now();
-    let second = download(make(None)).await;
-
-    // Si la segunda terminó bien, solo es válido que la primera ya hubiera publicado cuando la segunda
-    // intentó entrar (entonces habría usado otro nombre). La ventana de verificación depende de la máquina.
-    let overlapped = first_done
-        .lock()
+    let first = tokio::spawn(download(first_opts));
+    // La primera se detiene con el destino bloqueado, justo antes de verificar y publicar.
+    tokio::time::timeout(Duration::from_secs(60), gate.reached.acquire())
+        .await
+        .expect("la primera no llegó a la barrera")
         .unwrap()
-        .is_none_or(|t| t > second_start + Duration::from_millis(500));
-    if overlapped {
-        assert!(
-            matches!(second, Err(Error::Busy(_))),
-            "la segunda entró entre la transferencia y la publicación: {second:?}"
-        );
-    } else {
-        eprintln!(
-            "[ciclo] la primera publicó antes de que la segunda intentara entrar: sin solape"
-        );
-    }
+        .forget();
+    assert!(
+        dir.path().join("grande.bin.part").exists(),
+        "en la barrera el parcial completo sigue sin publicar"
+    );
+    assert!(!out.exists());
+
+    let second = download(second_opts).await;
+    assert!(
+        matches!(second, Err(Error::Busy(_))),
+        "la segunda entró entre la transferencia y la publicación: {second:?}"
+    );
+    assert!(
+        dir.path().join("grande.bin.part").exists(),
+        "la segunda rechazada no debe tocar el parcial de la primera"
+    );
+
+    gate.release.add_permits(1);
     first.await.unwrap().expect("la primera debe publicar bien");
     assert!(
         std::fs::read(&out).unwrap() == data,

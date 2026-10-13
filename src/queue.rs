@@ -125,6 +125,11 @@ impl Registry {
         (Self::load_inner(dir, owner.is_none()), owner)
     }
 
+    /// Esta instancia no es la propietaria de la cola de la carpeta (ni la guarda ni ve lo ajeno).
+    pub fn is_read_only(&self) -> bool {
+        self.0.read_only
+    }
+
     /// Carga la cola guardada sin tomar su propiedad. Lo que estaba en curso queda como `Interrupted`;
     /// lo pausado sigue pausado.
     pub fn load(dir: &Path) -> Self {
@@ -134,6 +139,9 @@ impl Registry {
     fn load_inner(dir: &Path, read_only: bool) -> Self {
         let text = std::fs::read_to_string(dir.join(QUEUE_FILE)).unwrap_or_default();
         let records: Vec<Record> = serde_json::from_str(&text).unwrap_or_default();
+        // Sin propiedad de la cola no se adopta lo ajeno: lo que figura «en curso» puede seguir corriendo
+        // en el propietario, y esta instancia no debe poder pausarlo, cancelarlo ni borrarlo.
+        let records = if read_only { Vec::new() } else { records };
         let entries = records
             .into_iter()
             .map(|mut record| {

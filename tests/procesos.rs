@@ -1,5 +1,7 @@
 //! Con procesos reales: una carpeta de descargas tiene un único propietario de la cola. El host del
 //! navegador y la cola programada (`run-queue`) no pueden escribirse el archivo de la cola a la vez.
+mod ranged;
+
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -106,6 +108,7 @@ fn un_segundo_host_funciona_pero_no_guarda_la_cola_y_lo_avisa_una_vez() {
             other => panic!("mensaje inesperado: {other:?}"),
         }
     }
+    // Una espera necesita persistirse; sin ser propietario se rechaza en lugar de aceptarla y perderla.
     send(
         &mut second,
         r#"{"type":"enqueue","id":"x","url":"http://127.0.0.1:9/a.zip","filename":"a.zip","queued":true}"#,
@@ -113,9 +116,15 @@ fn un_segundo_host_funciona_pero_no_guarda_la_cola_y_lo_avisa_una_vez() {
     loop {
         let msg = read_frame(&mut second);
         match msg["type"].as_str() {
+            Some("error") if msg["id"] == "x" => {
+                assert!(
+                    msg["message"].as_str().unwrap().contains("otra instancia"),
+                    "{msg}"
+                );
+                break;
+            }
             Some("error") => warnings += 1,
-            Some("accepted") => break,
-            other => panic!("mensaje inesperado: {other:?}"),
+            other => panic!("una espera no persistible no debe aceptarse: {other:?} {msg}"),
         }
     }
     drop(second.stdin.take());
@@ -132,4 +141,70 @@ fn un_segundo_host_funciona_pero_no_guarda_la_cola_y_lo_avisa_una_vez() {
         !String::from_utf8_lossy(&after).contains("a.zip"),
         "el segundo host no debe haber escrito su cola"
     );
+}
+
+fn until(child: &mut Child, kind: &str) -> serde_json::Value {
+    loop {
+        let msg = read_frame(child);
+        if msg["type"] == kind {
+            return msg;
+        }
+    }
+}
+
+/// Espera la primera respuesta a una orden sobre `id`, ignorando avisos generales y progreso.
+fn reply_for(child: &mut Child, id: &str) -> serde_json::Value {
+    loop {
+        let msg = read_frame(child);
+        if msg["id"] == id && msg["type"] != "progress" {
+            return msg;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_segundo_host_no_puede_pausar_ni_cancelar_una_descarga_activa_del_primero() {
+    let data = ranged::payload(24 << 20);
+    let addr = ranged::ranged(
+        std::sync::Arc::new(data.clone()),
+        Duration::from_millis(100),
+        0,
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = spawn_host(dir.path());
+    wait_until_owner(dir.path());
+    send(
+        &mut first,
+        &format!(r#"{{"type":"enqueue","id":"a","url":"http://{addr}/g.bin","filename":"g.bin"}}"#),
+    );
+    until(&mut first, "accepted");
+    let part = dir.path().join("g.bin.part");
+    let began = Instant::now();
+    while !part.exists() {
+        assert!(began.elapsed() < Duration::from_secs(15), "no empezó");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut second = spawn_host(dir.path());
+    for order in ["cancel", "pause", "resume"] {
+        send(&mut second, &format!(r#"{{"type":"{order}","id":"a"}}"#));
+        let reply = reply_for(&mut second, "a");
+        assert_eq!(reply["type"], "error", "{order}: {reply}");
+    }
+    assert!(part.exists(), "el segundo host borró el parcial ajeno");
+    drop(second.stdin.take());
+    assert!(second.wait().unwrap().success());
+    let queue = std::fs::read_to_string(dir.path().join(".w11dl-queue.json")).unwrap();
+    assert!(
+        queue.contains("\"running\"") && !queue.contains("\"interrupted\""),
+        "el segundo host no debe reescribir como interrumpida la descarga activa: {queue}"
+    );
+
+    // La del primero sigue y termina intacta.
+    until(&mut first, "done");
+    assert!(std::fs::read(dir.path().join("g.bin")).unwrap() == data);
+    drop(first.stdin.take());
+    assert!(first.wait().unwrap().success());
 }

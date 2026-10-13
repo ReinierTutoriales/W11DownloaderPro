@@ -191,6 +191,14 @@ where
                     run_video(id, page, out_dir, registry, tx, limiter).await;
                 });
             }
+            Ok(Incoming::Enqueue { id, queued, .. }) if queued && registry.is_read_only() => {
+                let _ = tx.send(Outgoing::Error {
+                    id,
+                    message: "otra instancia de W11DownloaderPro gestiona la cola de esta carpeta: \
+                              la espera no se podría guardar. Descarga ahora o cierra la otra instancia"
+                        .into(),
+                });
+            }
             Ok(Incoming::Enqueue {
                 id,
                 url,
@@ -258,7 +266,13 @@ where
             Ok(Incoming::Cancel { id }) => match registry.get(&id) {
                 Some(entry) if entry.record.state == State::Running => entry.control.cancel(),
                 Some(entry) if entry.record.state.is_resumable() => {
-                    remove_partials(&entry.record.path).await;
+                    if let Err(e) = crate::engine::discard_partials(&entry.record.path).await {
+                        let _ = tx.send(Outgoing::Error {
+                            id,
+                            message: format!("no se puede cancelar ahora: {e}"),
+                        });
+                        continue;
+                    }
                     if entry.record.via_ytdlp {
                         let dir = entry.record.path.parent().unwrap_or(&out_dir);
                         let _ =
@@ -776,18 +790,6 @@ fn persist(registry: &Registry, dir: &Path, tx: &mpsc::UnboundedSender<Outgoing>
             message,
         });
     }
-}
-
-/// Borra el parcial y su estado de reanudación de una descarga cancelada.
-async fn remove_partials(output: &Path) {
-    let part = naming_with_suffix(output, ".part");
-    let state = naming_with_suffix(output, ".part.state");
-    let _ = tokio::fs::remove_file(part).await;
-    let _ = tokio::fs::remove_file(state).await;
-}
-
-fn naming_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    naming::with_suffix(path, suffix)
 }
 
 #[cfg(test)]

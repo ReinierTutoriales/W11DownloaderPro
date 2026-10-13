@@ -145,6 +145,16 @@ Siguen sin verificarse: los efectos del bloqueo de archivos de Windows (mandator
 | E | Fechas HTTP inválidas aceptadas; política de confianza en `Last-Modified` | Confirmado: se aceptaban días inexistentes de un mes y horas sin validar el ancho | Gramática estricta (ancho fijo, solo dígitos, bisiestos, día de la semana coherente) y margen de 60 s entre `Date` y `Last-Modified`: origen y CDN pueden tener relojes distintos, así que ante la duda no se fía | `fechas_http_invalidas…`, `last_modified_es_fuerte_solo_con_margen…` |
 
 Coste asumido de E: un archivo modificado hace menos de un minuto no se reanuda sin SHA-256 (se pierde progreso, no integridad).
+Ronda 3 (revisión de 66f1ecb):
+
+| Hallazgo | Estado | Corrección | Prueba |
+|---|---|---|---|
+| La prueba del ciclo calculaba el SHA-256 esperado dentro de `make(...)`, tras la transferencia, y el criterio de 500 ms permitía pasar sin exigir `Busy` | Confirmado y retirado el criterio | Barrera determinista solo con la feature `test-hooks` (`engine::Gate`): la primera se detiene con el destino bloqueado justo antes de verificar; la segunda debe recibir `Busy`; luego se libera y se comprueban contenido y limpieza. Hash y opciones se preparan antes de arrancar. **Comprobación de mutación:** con `lock_exclusive` anulado la prueba falla (la segunda descargaba de nuevo); restaurado, pasa | `tests/ciclo.rs` |
+| Un segundo host adoptaba la cola ajena (`running` → `interrupted`) y podía cancelar y borrar parciales sin bloqueo; aceptaba esperas que no se guardaban | Corregido | Sin propiedad de la cola, la instancia no carga registros ajenos (empieza vacía), rechaza `queued` con un error explícito, y el borrado de parciales de una cancelación toma antes el bloqueo del destino (`engine::discard_partials`, `Busy` si está en uso). **Mutación:** adoptando la cola ajena la prueba falla | `tests/procesos.rs` (procesos reales: cancelar/pausar/reanudar desde el segundo host devuelven error, el parcial sigue, la cola no se reescribe y la descarga del primero termina intacta) |
+| `refusal`: una medición y factor fijo | Separado | Pruebas funcionales (completa, contenido, ≤ 8 rechazos) distintas del control de rendimiento (mejor de 3 frente al mejor de 3 de un solo flujo, factor 2 + 500 ms) | `tests/refusal.rs` |
+
+Corrección de una afirmación anterior: la prueba de ciclo no pasa por el adjudicador de nombres del host (ambas descargas usan el mismo destino), y `procesos.rs` no cubría dos descargas compitiendo durante el hash y la publicación; ahora lo cubren `ciclo.rs` (mismo proceso, determinista) y el bloqueo exclusivo del sistema operativo.
+
 Pendiente de verificar: el comportamiento de estos bloqueos y de `RestartOnFailure` en la CI y en un Windows 11 de escritorio.
 
 ## 8. No verificado

@@ -113,74 +113,83 @@ async fn limited(
     (addr, stats)
 }
 
-async fn run(
+/// Una descarga de 6 MiB contra un servidor que acepta `limit` fragmentos a la vez y rechaza el resto.
+async fn once(
+    limit: usize,
     status: u16,
+    connections: usize,
 ) -> (
     Result<(), String>,
+    Duration,
     Arc<Stats>,
     Vec<u8>,
     std::path::PathBuf,
     tempfile::TempDir,
 ) {
     let data = payload(6 * 1024 * 1024);
-    let (addr, stats) = limited(Arc::new(data.clone()), 1, status, None).await;
+    let (addr, stats) = limited(Arc::new(data.clone()), limit, status, None).await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("l.bin");
     let mut opts = Options::new(format!("http://{addr}/f.bin"), out.clone());
-    opts.connections = 8;
+    opts.connections = connections;
     opts.max_chunk = 256 * 1024;
-    // Referencia en esta misma máquina: un único flujo contra un servidor sin límite.
-    let baseline = {
-        let (addr, _) = limited(Arc::new(data.clone()), 64, status, None).await;
-        let d = tempfile::tempdir().unwrap();
-        let mut o = Options::new(format!("http://{addr}/f.bin"), d.path().join("b.bin"));
-        o.connections = 1;
-        o.max_chunk = 256 * 1024;
-        let t = std::time::Instant::now();
-        download(o).await.expect("la referencia debe completar");
-        t.elapsed()
-    };
     let started = std::time::Instant::now();
     let result = download(opts).await.map(|_| ()).map_err(|e| e.to_string());
-    let elapsed = started.elapsed();
+    (result, started.elapsed(), stats, data, out, dir)
+}
+
+/// Prueba funcional: completa, el contenido es idéntico y no insiste contra el servidor.
+async fn functional(status: u16) {
+    let (result, elapsed, stats, data, out, _dir) = once(1, status, 8).await;
     eprintln!(
         "[refusal {status}] tiempo={:.2}s servidas={} rechazadas={}",
-        started.elapsed().as_secs_f64(),
+        elapsed.as_secs_f64(),
         stats.served.load(Ordering::SeqCst),
         stats.refused.load(Ordering::SeqCst)
     );
     assert!(
-        elapsed < baseline.mul_f64(1.6) + Duration::from_millis(500),
-        "con un solo flujo aceptado debe tardar como la referencia ({baseline:?}), no esperar reintentos: {elapsed:?}"
+        result.is_ok(),
+        "la descarga no debe abortar: {result:?} (rechazos {})",
+        stats.refused.load(Ordering::SeqCst)
     );
     assert!(
         stats.refused.load(Ordering::SeqCst) <= 8,
         "no debe insistir contra el servidor: {} rechazos",
         stats.refused.load(Ordering::SeqCst)
     );
-    (result, stats, data, out, dir)
+    assert_eq!(std::fs::read(&out).unwrap(), data);
 }
 
 #[tokio::test]
 async fn servidor_que_rechaza_con_503_el_exceso_no_aborta_la_descarga() {
-    let (result, stats, data, out, _dir) = run(503).await;
-    assert!(
-        result.is_ok(),
-        "la descarga no debe abortar: {result:?} (rechazos {})",
-        stats.refused.load(Ordering::SeqCst)
-    );
-    assert_eq!(std::fs::read(&out).unwrap(), data);
+    functional(503).await;
 }
 
 #[tokio::test]
 async fn servidor_que_rechaza_con_429_el_exceso_no_aborta_la_descarga() {
-    let (result, stats, data, out, _dir) = run(429).await;
+    functional(429).await;
+}
+
+/// Control de rendimiento, aparte de lo funcional: comparar el mejor de varias ejecuciones con el mejor de
+/// la referencia de un único flujo en la misma máquina absorbe el ruido de un runner compartido.
+#[tokio::test]
+async fn los_rechazos_no_alargan_la_descarga_frente_a_un_solo_flujo() {
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        let (r, t, ..) = once(64, 503, 1).await;
+        r.expect("la referencia debe completar");
+        baseline = baseline.min(t);
+    }
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        let (r, t, ..) = once(1, 503, 8).await;
+        r.expect("debe completar");
+        best = best.min(t);
+    }
     assert!(
-        result.is_ok(),
-        "la descarga no debe abortar: {result:?} (rechazos {})",
-        stats.refused.load(Ordering::SeqCst)
+        best < baseline * 2 + Duration::from_millis(500),
+        "con un solo flujo aceptado debe tardar como la referencia ({baseline:?}), no esperar reintentos: {best:?}"
     );
-    assert_eq!(std::fs::read(&out).unwrap(), data);
 }
 
 #[tokio::test]

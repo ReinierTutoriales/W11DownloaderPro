@@ -25,7 +25,12 @@ scraper = "0.27"
 url = "2.5"
 robotstxt = "0.3"
 
+[features]
+# Ganchos solo para pruebas (barreras deterministas); no forman parte de ninguna compilación publicada.
+test-hooks = []
+
 [dev-dependencies]
+w11dl = { path = ".", features = ["test-hooks"] }
 hyper = { version = "1.12", features = ["server"] }
 tempfile = "3"
 

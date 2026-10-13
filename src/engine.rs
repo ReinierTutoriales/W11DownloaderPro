@@ -57,6 +57,27 @@ pub struct Options {
     pub idle_timeout: Duration,
     /// Límite de velocidad compartido. El mismo `Arc` en varias descargas reparte un límite global.
     pub limiter: Option<Arc<crate::limits::RateLimiter>>,
+    /// Solo pruebas: detiene la descarga, con el destino bloqueado, justo antes de verificar y publicar.
+    #[cfg(feature = "test-hooks")]
+    pub gate: Option<Arc<Gate>>,
+}
+
+/// Barrera de pruebas: la descarga avisa de que llegó (`reached`) y espera a que se la libere (`release`).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+pub struct Gate {
+    pub reached: tokio::sync::Semaphore,
+    pub release: tokio::sync::Semaphore,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
 }
 
 impl Options {
@@ -72,6 +93,8 @@ impl Options {
             headers: HeaderMap::new(),
             progress: None,
             limiter: None,
+            #[cfg(feature = "test-hooks")]
+            gate: None,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
@@ -180,6 +203,20 @@ pub async fn download_controlled(opts: Options, control: Control) -> Result<Outc
     result
 }
 
+/// Borra el parcial y el estado de un destino que no se está descargando. Toma antes el bloqueo del
+/// destino: si otra descarga lo tiene, devuelve `Busy` sin tocar nada.
+pub async fn discard_partials(output: &Path) -> Result<()> {
+    let paths = Paths {
+        part: with_suffix(output, ".part"),
+        state: with_suffix(output, ".part.state"),
+    };
+    let lock = open_locked(&paths.part).await?;
+    let _ = tokio::fs::remove_file(&paths.part).await;
+    let _ = tokio::fs::remove_file(&paths.state).await;
+    drop(lock);
+    Ok(())
+}
+
 async fn run_locked(
     opts: &Options,
     control: &Control,
@@ -225,6 +262,14 @@ async fn run_locked(
             });
         }
     };
+
+    #[cfg(feature = "test-hooks")]
+    if let Some(gate) = &opts.gate {
+        gate.reached.add_permits(1);
+        if let Ok(permit) = gate.release.acquire().await {
+            permit.forget();
+        }
+    }
 
     let (part, state_path) = (&paths.part, &paths.state);
     if let Some(expected) = &opts.sha256 {
