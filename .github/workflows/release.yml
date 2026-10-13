@@ -68,6 +68,8 @@ jobs:
           dir=$(pwd)/$(ls -d dist/w11dl-*-windows-x64)
           export W11DL_PYTHON="$dir/tools/yt-dlp.exe"
           export PATH="$dir/tools:$PATH"
+          # W11DL_TRACE: si una prueba temporal falla, su salida incluye las decisiones del motor.
+          export W11DL_TRACE=1
           cargo test --no-fail-fast
 
       - name: Pruebas de la extensión

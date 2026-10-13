@@ -273,8 +273,24 @@ async fn el_host_descarga_un_hls_con_ytdlp_y_deja_el_archivo_real() {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| {
-            n.starts_with(".w11dl-") && n != ".w11dl-queue.json" && n != ".w11dl-queue.lock"
+            n.starts_with(".w11dl-")
+                && n != ".w11dl-queue.json"
+                && n != ".w11dl-queue.lock"
+                && n != ".w11dl-locks"
         })
         .collect();
     assert!(leftovers.is_empty(), "restos de intermedios: {leftovers:?}");
+    // La carpeta de exclusión es persistente por diseño: solo contiene archivos de bloqueo vacíos.
+    let locks: Vec<_> = std::fs::read_dir(dir.path().join(".w11dl-locks"))
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    for entry in &locks {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(name.ends_with(".lock"), "no es un bloqueo: {name}");
+        assert_eq!(
+            entry.metadata().unwrap().len(),
+            0,
+            "{name} debe estar vacío"
+        );
+    }
 }

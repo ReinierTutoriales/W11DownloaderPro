@@ -478,6 +478,8 @@ async fn segmented(session: &Session<'_>, total: u64) -> Result<Step> {
         flights: std::sync::Mutex::new(HashMap::new()),
         typical_rate: AtomicU64::new(0),
         hedges: AtomicUsize::new(0),
+        trace: std::env::var_os("W11DL_TRACE").is_some(),
+        epoch: Instant::now(),
         limiter: opts.limiter.clone(),
         saving: Mutex::new(()),
         settled: tokio::sync::Notify::new(),
@@ -630,6 +632,9 @@ struct Shared {
     typical_rate: AtomicU64,
     /// Copias lanzadas (diagnóstico y pruebas).
     hedges: AtomicUsize,
+    /// Diagnóstico (`W11DL_TRACE`): decisiones de copia de fragmentos lentos.
+    trace: bool,
+    epoch: Instant,
     limiter: Option<Arc<crate::limits::RateLimiter>>,
     /// Un solo guardado de estado a la vez: comparten archivo temporal y el más reciente debe ser el último.
     saving: Mutex<()>,
@@ -676,10 +681,21 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(chunk.index, Arc::clone(&flight));
+        self.note(format_args!("fragmento {} empieza", chunk.index));
         flight
     }
 
+    fn note(&self, what: std::fmt::Arguments<'_>) {
+        if self.trace {
+            eprintln!(
+                "[hedge] t={:.3}s {what}",
+                self.epoch.elapsed().as_secs_f64()
+            );
+        }
+    }
+
     fn end_flight(&self, flight: &Arc<Flight>) {
+        self.note(format_args!("fragmento {} termina", flight.chunk.index));
         let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
         if flights
             .get(&flight.chunk.index)
@@ -714,6 +730,11 @@ impl Shared {
         if self.refusals.load(Ordering::Relaxed) > 0
             || self.limiter.as_ref().is_some_and(|l| l.rate() > 0)
         {
+            self.note(format_args!(
+                "sin copias: rechazos={} limite={}",
+                self.refusals.load(Ordering::Relaxed),
+                self.limiter.as_ref().map_or(0, |l| l.rate())
+            ));
             return Idle::Done;
         }
         let typical = self.typical_rate();
@@ -730,6 +751,19 @@ impl Shared {
                 flight.started.elapsed().as_millis() as u64,
                 typical,
             );
+            let (received, age) = (
+                flight.received.load(Ordering::Relaxed),
+                flight.started.elapsed(),
+            );
+            self.note(format_args!(
+                "libre: fragmento {} edad={:.0}ms recibido={}/{} tipica={:.2}MB/s copiar={}",
+                flight.chunk.index,
+                age.as_secs_f64() * 1e3,
+                received,
+                flight.chunk.len(),
+                typical / 1e6,
+                worthwhile
+            ));
             if worthwhile && !flight.hedged.swap(true, Ordering::Relaxed) {
                 self.hedges.fetch_add(1, Ordering::Relaxed);
                 return Idle::Copy(Arc::clone(flight));

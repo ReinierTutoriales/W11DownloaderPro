@@ -255,6 +255,9 @@ async fn read_manifest(track: &Path) -> Option<engine::Identity> {
     serde_json::from_slice(&text).ok()
 }
 
+/// Veces que se baja una pista cuyo recurso cambia mientras se descarga.
+const TRACK_ATTEMPTS: u32 = 3;
+
 /// Consulta la identidad compitiendo con el control: `None` si se pidió pausar o cancelar mientras
 /// esperaba al servidor (una consulta que se calla no retrasa las órdenes del usuario).
 async fn identify_or_stop(opts: &Options, control: &Control) -> Option<Option<engine::Identity>> {
@@ -302,14 +305,15 @@ async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
         }
         engine::remove_if_exists(&opts.output).await?;
     }
-    engine::remove_if_exists(&manifest_of(&opts.output)).await?;
-
-    let Some(before) = identify_or_stop(&opts, &control).await else {
-        return Ok(stopped(&control));
-    };
-    let outcome = engine::download_controlled(opts.clone(), control.clone()).await?;
-    if let (Outcome::Completed(report), Some(before)) = (&outcome, before) {
-        // Solo se certifica si el recurso sigue siendo el mismo después de bajarlo.
+    for attempt in 1..=TRACK_ATTEMPTS {
+        engine::remove_if_exists(&manifest_of(&opts.output)).await?;
+        let Some(before) = identify_or_stop(&opts, &control).await else {
+            return Ok(stopped(&control));
+        };
+        let outcome = engine::download_controlled(opts.clone(), control.clone()).await?;
+        let Outcome::Completed(report) = &outcome else {
+            return Ok(outcome);
+        };
         let Some(after) = identify_or_stop(&opts, &control).await else {
             return Ok(match stopped(&control) {
                 Outcome::Paused { .. } => Outcome::Paused {
@@ -318,11 +322,35 @@ async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
                 other => other,
             });
         };
-        if after.as_ref() == Some(&before) && !control.is_interrupted() {
-            write_manifest(&opts.output, &before).await?;
+        match (before, after) {
+            // Identidad comprobada y distinta: el recurso cambió mientras se bajaba. La pista no vale
+            // para continuar (podría mezclar dos versiones): se descarta y se baja de nuevo, con un
+            // número acotado de intentos.
+            (Some(before), Some(after)) if before != after => {
+                engine::remove_if_exists(&opts.output).await?;
+                if attempt == TRACK_ATTEMPTS {
+                    return Err(Error::Video(format!(
+                        "el recurso cambió mientras se descargaba ({TRACK_ATTEMPTS} intentos): {}",
+                        opts.url
+                    )));
+                }
+            }
+            // Mismo recurso antes y después: la pista queda certificada para reutilizarla.
+            (Some(before), Some(_)) => {
+                if !control.is_interrupted() {
+                    write_manifest(&opts.output, &before).await?;
+                }
+                return Ok(outcome);
+            }
+            // No se pudo comprobar (consulta fallida o sin validador fuerte): la pista se usa pero no
+            // se certifica, así que no se reutilizará en otra ejecución.
+            _ => return Ok(outcome),
         }
     }
-    Ok(outcome)
+    Err(Error::Video(format!(
+        "no se pudo obtener una pista estable: {}",
+        opts.url
+    )))
 }
 
 /// Borra las pistas, sus parciales y el temporal de unión de un destino. Ausente no es un fallo; el

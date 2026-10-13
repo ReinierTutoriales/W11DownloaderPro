@@ -535,3 +535,119 @@ async fn pausar_y_cancelar_atienden_la_consulta_de_identidad_aunque_el_servidor_
         }
     }
 }
+
+/// Servidor cuya versión (ETag) cambia cada vez que se sirven datos, hasta `stable_after` cambios.
+/// `/a.m4a` no cambia nunca. El ETag de los datos es el de antes de servirlos, como un recurso que
+/// se republica justo después de bajarse.
+async fn changing_server(video: Vec<u8>, stable_after: usize) -> std::net::SocketAddr {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let video = Arc::new(video);
+    let audio = Arc::new(payload(20_000));
+    let served = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (video, audio, served) = (video.clone(), audio.clone(), served.clone());
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let (video, audio, served) = (video.clone(), audio.clone(), served.clone());
+                    async move {
+                        let is_video = req.uri().path() == "/v.mp4";
+                        let body: &Vec<u8> = if is_video { &video } else { &audio };
+                        let (start, end) = req
+                            .headers()
+                            .get(RANGE)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.strip_prefix("bytes="))
+                            .and_then(|v| v.split_once('-'))
+                            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+                            .unwrap_or((0, body.len() - 1));
+                        let end: usize = end.min(body.len() - 1);
+                        let data = !((start, end) == (0, 0));
+                        let version = if is_video {
+                            served.load(Ordering::SeqCst).min(stable_after)
+                        } else {
+                            0
+                        };
+                        if data && is_video {
+                            served.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(206)
+                                .header(ETAG, format!("\"e{version}\""))
+                                .header(ACCEPT_RANGES, "bytes")
+                                .header(
+                                    CONTENT_RANGE,
+                                    format!("bytes {start}-{end}/{}", body.len()),
+                                )
+                                .header(CONTENT_LENGTH, end - start + 1)
+                                .body(Full::new(Bytes::copy_from_slice(&body[start..=end])))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn un_recurso_que_cambia_mientras_se_baja_no_llega_a_la_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("final.mp4");
+    let addr = changing_server(payload(30_000), usize::MAX).await;
+    let result = download_merged(
+        Options::new("ignorada", &out),
+        job(addr, hanging_ffmpeg(dir.path())),
+        Control::default(),
+    )
+    .await;
+    let err = result.expect_err("una pista que no se estabiliza debe fallar");
+    assert!(err.to_string().contains("cambió"), "{err}");
+    assert!(
+        !dir.path().join("ffmpeg-arranco").exists(),
+        "no debía llegar a unir"
+    );
+    assert!(!out.exists());
+    assert!(
+        !dir.path().join("final.mp4.video").exists()
+            && !dir.path().join("final.mp4.video.done").exists(),
+        "la pista dudosa se descarta"
+    );
+}
+
+#[tokio::test]
+async fn si_el_recurso_se_estabiliza_en_un_reintento_se_certifica_y_continua() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("final.mp4");
+    let video = payload(30_000);
+    let addr = changing_server(video.clone(), 1).await;
+    let control = Control::default();
+    let handle = tokio::spawn(download_merged(
+        Options::new("ignorada", &out),
+        job(addr, hanging_ffmpeg(dir.path())),
+        control.clone(),
+    ));
+    wait_for(&dir.path().join("ffmpeg-arranco")).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("final.mp4.video")).unwrap(),
+        video
+    );
+    assert!(dir.path().join("final.mp4.video.done").exists());
+    control.cancel();
+    let _ = handle.await;
+}
