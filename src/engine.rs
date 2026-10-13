@@ -952,12 +952,13 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250u64 << attempt.min(6))
 }
 
-/// Las cabeceras de sesión solo viajan al host original: una redirección a otro dominio no las recibe.
+/// Las cabeceras de sesión solo viajan al sitio original sin degradar el cifrado: una redirección a otro
+/// dominio, o de https a http, no las recibe.
 fn headers_for(original: &str, final_url: &Uri, headers: &HeaderMap) -> HeaderMap {
-    let same_host = net::parse_url(original)
+    let same_site = net::parse_url(original)
         .ok()
-        .is_some_and(|u| u.authority() == final_url.authority());
-    if same_host {
+        .is_some_and(|u| net::may_forward_session(&u, final_url));
+    if same_site {
         headers.clone()
     } else {
         HeaderMap::new()
@@ -973,6 +974,22 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn las_cabeceras_de_sesion_no_siguen_una_degradacion_a_http() {
+        let mut sesion = HeaderMap::new();
+        sesion.insert("cookie", "sid=secreto".parse().unwrap());
+        let url = |s: &str| s.parse::<Uri>().unwrap();
+        let mantiene = |final_url: &str| {
+            !headers_for("https://sitio.test/a.zip", &url(final_url), &sesion).is_empty()
+        };
+        assert!(mantiene("https://sitio.test/cdn/a.zip"));
+        assert!(
+            !mantiene("http://sitio.test/a.zip"),
+            "https -> http filtraría la cookie en claro"
+        );
+        assert!(!mantiene("https://cdn.otro.test/a.zip"));
+    }
 
     #[test]
     fn el_muestreador_calcula_la_velocidad_de_la_ventana() {

@@ -32,6 +32,23 @@ fn apply_extra<B>(req: &mut Request<B>, extra: &HeaderMap) {
     }
 }
 
+/// ¿Pueden viajar las cabeceras de sesión (cookies…) de la petición original a `target`?
+///
+/// Solo al mismo sitio (host y puerto) y sin degradar el cifrado: de `https` a `http` nunca, aunque
+/// el host sea el mismo, porque una cookie obtenida para HTTPS viajaría en claro. Pasar de `http` a
+/// `https` sí está permitido (sube la protección).
+pub fn may_forward_session(origin: &Uri, target: &Uri) -> bool {
+    let host = |u: &Uri| u.authority().map(|a| a.as_str().to_ascii_lowercase());
+    if host(origin).is_none() || host(origin) != host(target) {
+        return false;
+    }
+    match (origin.scheme_str(), target.scheme_str()) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case("http") && b.eq_ignore_ascii_case("https"),
+        _ => false,
+    }
+}
+
 /// Metadatos del recurso remoto tras sondearlo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
@@ -73,7 +90,7 @@ pub fn parse_url(raw: &str) -> Result<Uri> {
 /// para conocer la URL final y evita descargar el cuerpo.
 pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<Remote> {
     let mut uri = parse_url(raw)?;
-    let origin = uri.authority().cloned();
+    let origin = uri.clone();
 
     for _ in 0..=MAX_REDIRECTS {
         let mut req = Request::builder()
@@ -84,7 +101,7 @@ pub async fn probe(client: &HttpClient, raw: &str, extra: &HeaderMap) -> Result<
             .header(RANGE, "bytes=0-0")
             .body(Empty::<Bytes>::new())
             .map_err(|e| Error::InvalidUrl(e.to_string()))?;
-        if uri.authority() == origin.as_ref() {
+        if may_forward_session(&origin, &uri) {
             apply_extra(&mut req, extra);
         }
 
@@ -298,6 +315,40 @@ fn resolve(base: &Uri, location: &str) -> Result<Uri> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn la_sesion_no_viaja_a_otro_sitio_ni_degrada_el_cifrado() {
+        let u = |s: &str| s.parse::<Uri>().unwrap();
+        let https = u("https://sitio.test/a");
+        assert!(may_forward_session(&https, &u("https://sitio.test/b")));
+        assert!(
+            may_forward_session(&https, &u("https://SITIO.test/b")),
+            "el host no distingue mayúsculas"
+        );
+        assert!(
+            !may_forward_session(&https, &u("http://sitio.test/b")),
+            "https -> http nunca"
+        );
+        assert!(!may_forward_session(&https, &u("https://otro.test/b")));
+        assert!(
+            !may_forward_session(&https, &u("https://sitio.test:8443/b")),
+            "otro puerto, otro sitio"
+        );
+        assert!(!may_forward_session(
+            &https,
+            &u("https://sitio.test.otro.test/b")
+        ));
+        // Subir de http a https es seguro.
+        assert!(may_forward_session(&u("http://sitio.test/a"), &https));
+        assert!(may_forward_session(
+            &u("http://sitio.test/a"),
+            &u("http://sitio.test/z")
+        ));
+        assert!(!may_forward_session(
+            &u("http://sitio.test/a"),
+            &u("ftp://sitio.test/z")
+        ));
+    }
 
     #[test]
     fn content_range_de_un_fragmento() {
