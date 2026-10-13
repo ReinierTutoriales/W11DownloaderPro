@@ -134,7 +134,11 @@ pub async fn download(
 ) -> Result<(Outcome, Option<PathBuf>)> {
     let started = Instant::now();
     tokio::fs::create_dir_all(&job.out_dir).await?;
-    let mut child = Command::new(&job.python)
+    let mut command = Command::new(&job.python);
+    // Grupo de procesos propio: así se puede matar yt-dlp y todo lo que lance de una vez.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .args(build_args(job))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -238,6 +242,16 @@ pub async fn download(
 /// programa real como proceso hijo: matar solo al arrancador deja al hijo escribiendo en la carpeta
 /// de intermedios, y al reanudar habría dos procesos sobre los mismos archivos.
 async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
     #[cfg(windows)]
     if let Some(pid) = child.id() {
         let _ = Command::new("taskkill")
