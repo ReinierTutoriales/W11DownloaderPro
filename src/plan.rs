@@ -311,27 +311,80 @@ pub fn hedge_worthwhile(len: u64, received: u64, age_ms: u64, typical_rate: f64)
     eta_original >= 2.0 * eta_copy
 }
 
+/// Segundos desde 1970 de una fecha HTTP en formato IMF (`Sun, 06 Nov 1994 08:49:37 GMT`), el único
+/// que los servidores deben enviar hoy. Cualquier otra forma se trata como desconocida.
+pub fn parse_http_date(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (_, rest) = text.split_once(", ")?;
+    let mut parts = rest.split_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let name = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == name)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut clock = parts.next()?.split(':');
+    let (h, m, sec): (i64, i64, i64) = (
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+    );
+    if parts.next()? != "GMT" || parts.next().is_some() || clock.next().is_some() {
+        return None;
+    }
+    if !(1..=31).contains(&day) || h > 23 || m > 59 || sec > 60 || year < 1970 {
+        return None;
+    }
+    // Días desde 1970-01-01 (algoritmo de calendario civil de Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
+}
+
 /// Validadores del recurso remoto: lo que permite saber si sigue siendo el mismo archivo.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Validators {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// `Last-Modified` solo es un validador fuerte si el recurso se modificó al menos un segundo
+    /// antes de la fecha de la respuesta (RFC 9110 §8.8.2.2): dos cambios dentro del mismo segundo
+    /// no se distinguirían. Sin `Date`, o con fechas ilegibles o futuras, no es fuerte.
+    pub lm_strong: bool,
 }
 
 impl Validators {
-    pub fn new(etag: Option<String>, last_modified: Option<String>) -> Self {
+    pub fn new(
+        etag: Option<String>,
+        last_modified: Option<String>,
+        response_date: Option<&str>,
+    ) -> Self {
+        let lm_strong = match (
+            last_modified.as_deref().and_then(parse_http_date),
+            response_date.and_then(parse_http_date),
+        ) {
+            (Some(modified), Some(date)) => date - modified >= 1,
+            _ => false,
+        };
         Self {
             etag,
             last_modified,
+            lm_strong,
         }
     }
 
     /// Valor para `If-Range`. La RFC 9110 §13.1.5 solo admite validadores fuertes: un `ETag`
-    /// débil (`W/"…"`) nunca coincide, así que se usa `Last-Modified` en su lugar.
+    /// débil (`W/"…"`) nunca coincide, y un `Last-Modified` solo cuenta si es fuerte.
     pub fn if_range(&self) -> Option<&str> {
         match self.etag.as_deref() {
             Some(tag) if !tag.starts_with("W/") => Some(tag),
-            _ => self.last_modified.as_deref(),
+            _ if self.lm_strong => self.last_modified.as_deref(),
+            _ => None,
         }
     }
 }
@@ -356,6 +409,9 @@ pub struct State {
     /// `Last-Modified` de la respuesta original. Estados antiguos no lo traen.
     #[serde(default)]
     pub last_modified: Option<String>,
+    /// Si ese `Last-Modified` era un validador fuerte. Estados antiguos: no.
+    #[serde(default)]
+    pub lm_strong: bool,
     pub done: Vec<bool>,
 }
 
@@ -368,6 +424,7 @@ impl State {
             chunk_size,
             etag: validators.etag,
             last_modified: validators.last_modified,
+            lm_strong: validators.lm_strong,
             done: vec![false; count],
         }
     }
@@ -395,13 +452,13 @@ impl State {
             _ => None,
         };
         let modified = match (&self.last_modified, &current.last_modified) {
-            (Some(a), Some(b)) => Some(a.trim() == b.trim()),
+            (Some(a), Some(b)) => Some((a.trim() == b.trim(), self.lm_strong && current.lm_strong)),
             _ => None,
         };
-        if etag.is_some_and(|(same, _)| !same) || modified == Some(false) {
+        if etag.is_some_and(|(same, _)| !same) || modified.is_some_and(|(same, _)| !same) {
             return false;
         }
-        let verified = etag == Some((true, true)) || modified == Some(true);
+        let verified = etag == Some((true, true)) || modified == Some((true, true));
         verified || allow_unverified
     }
 
@@ -687,8 +744,13 @@ mod tests {
         assert_eq!(effective_chunk_size(u64::MAX / 2, 8, 4 << 20), 4 << 20);
     }
 
+    /// Validadores de prueba: un `Last-Modified` se considera fuerte.
     fn v(etag: Option<&str>, lm: Option<&str>) -> Validators {
-        Validators::new(etag.map(Into::into), lm.map(Into::into))
+        Validators {
+            etag: etag.map(Into::into),
+            last_modified: lm.map(Into::into),
+            lm_strong: lm.is_some(),
+        }
     }
 
     #[test]
@@ -759,6 +821,84 @@ mod tests {
         assert!(!s.matches("http://x/a", 100, &v(Some("\"e\""), None), false));
         assert!(s.matches("http://x/a", 100, &v(Some("\"e\""), None), true));
         assert!(!s.matches("http://x/a", 100, &v(None, Some("Tue")), true));
+    }
+
+    #[test]
+    fn fechas_http() {
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date("Thu, 29 Feb 2024 12:00:00 GMT"),
+            Some(1_709_208_000)
+        );
+        for bad in [
+            "",
+            "ayer",
+            "Sun Nov  6 08:49:37 1994",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 UTC",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Foo 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 25:49:37 GMT",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn last_modified_es_fuerte_solo_un_segundo_antes_de_la_fecha() {
+        let lm = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let with = |date: Option<&str>| Validators::new(None, Some(lm.into()), date);
+        assert!(
+            with(Some("Sun, 06 Nov 1994 08:49:38 GMT")).lm_strong,
+            "un segundo antes basta"
+        );
+        assert!(with(Some("Mon, 07 Nov 1994 08:49:37 GMT")).lm_strong);
+        assert!(
+            !with(Some("Sun, 06 Nov 1994 08:49:37 GMT")).lm_strong,
+            "mismo segundo: débil"
+        );
+        assert!(
+            !with(Some("Sun, 06 Nov 1994 08:49:36 GMT")).lm_strong,
+            "modificado en el futuro"
+        );
+        assert!(!with(None).lm_strong, "sin Date no se puede saber");
+        assert!(!with(Some("basura")).lm_strong);
+        assert!(
+            !Validators::new(
+                None,
+                Some("basura".into()),
+                Some("Mon, 07 Nov 1994 08:49:37 GMT")
+            )
+            .lm_strong
+        );
+    }
+
+    #[test]
+    fn last_modified_debil_no_sirve_ni_para_if_range_ni_para_verificar() {
+        let weak = Validators::new(
+            None,
+            Some("Sun, 06 Nov 1994 08:49:37 GMT".into()),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        assert_eq!(weak.if_range(), None);
+        let s = State::new("http://x/a", 100, 10, weak.clone());
+        assert!(!s.matches("http://x/a", 100, &weak, false), "no verifica");
+        assert!(
+            s.matches("http://x/a", 100, &weak, true),
+            "con SHA-256 sí se permite"
+        );
+        let changed = Validators {
+            last_modified: Some("Sun, 06 Nov 1994 08:49:40 GMT".into()),
+            ..weak
+        };
+        assert!(
+            !s.matches("http://x/a", 100, &changed, true),
+            "distinto invalida siempre"
+        );
     }
 
     #[test]

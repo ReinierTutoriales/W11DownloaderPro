@@ -311,7 +311,7 @@ async fn reanuda_solo_los_fragmentos_pendientes() {
         &url,
         data.len() as u64,
         chunk_size,
-        Validators::new(Some(ETAG_VALUE.into()), None),
+        Validators::new(Some(ETAG_VALUE.into()), None, None),
     );
     let chunks = plan::plan(data.len() as u64, chunk_size);
     let half = chunks.len() / 2;
@@ -371,7 +371,7 @@ async fn estado_de_otro_plan_se_descarta_y_no_corrompe_el_archivo() {
         &url,
         data.len() as u64,
         chunk_size,
-        Validators::new(Some(ETAG_VALUE.into()), None),
+        Validators::new(Some(ETAG_VALUE.into()), None, None),
     );
     stale.done = vec![true; right_len + 5];
     std::fs::write(dir.path().join("viejo.bin.part"), vec![0u8; data.len()]).unwrap();
@@ -435,7 +435,7 @@ async fn recurso_cambiado_en_el_servidor_no_se_reanuda() {
         "cambiado.bin",
         &data,
         &url,
-        Validators::new(Some("\"v0\"".into()), None),
+        Validators::new(Some("\"v0\"".into()), None, None),
     );
 
     let report = download(opts).await.unwrap();
@@ -528,11 +528,15 @@ async fn reanudar_sin_validadores_un_archivo_cambiado_lo_detecta_el_hash() {
 #[tokio::test]
 async fn etag_debil_usa_last_modified_en_if_range_y_reanuda() {
     let data = payload(2 * 1024 * 1024);
-    let lm = "Wed, 21 Oct 2026 07:28:00 GMT";
+    let lm = "Wed, 21 Oct 2020 07:28:00 GMT";
     let (addr, server) = start_with(data.clone(), true, 0, Some("W/\"v1\""), Some(lm)).await;
     let dir = tempfile::tempdir().unwrap();
     let url = format!("http://{addr}/file");
-    let saved = Validators::new(Some("W/\"v1\"".into()), Some(lm.into()));
+    let saved = Validators::new(
+        Some("W/\"v1\"".into()),
+        Some(lm.into()),
+        Some("Thu, 01 Jan 2026 00:00:00 GMT"),
+    );
     let (opts, chunks, half) = interrupted(dir.path(), "debil.bin", &data, &url, saved);
 
     let report = download(opts).await.unwrap();
@@ -553,7 +557,7 @@ async fn parcial_truncado_con_estado_de_completados_no_se_reutiliza() {
         "truncado.bin",
         &data,
         &url,
-        Validators::new(Some(ETAG_VALUE.into()), None),
+        Validators::new(Some(ETAG_VALUE.into()), None, None),
     );
     // El parcial perdió su final (disco lleno, copia a medias…) pero el estado sigue diciendo "hecho".
     let part = dir.path().join("truncado.bin.part");
@@ -588,7 +592,7 @@ async fn parcial_mas_largo_de_lo_debido_tampoco_se_reutiliza() {
         "largo.bin",
         &data,
         &url,
-        Validators::new(Some(ETAG_VALUE.into()), None),
+        Validators::new(Some(ETAG_VALUE.into()), None, None),
     );
     let part = dir.path().join("largo.bin.part");
     let mut bytes = std::fs::read(&part).unwrap();
@@ -599,4 +603,26 @@ async fn parcial_mas_largo_de_lo_debido_tampoco_se_reutiliza() {
 
     assert_eq!(report.resumed, 0);
     assert_eq!(std::fs::read(dir.path().join("largo.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn last_modified_en_el_futuro_no_verifica_el_parcial() {
+    // Un LM posterior a la fecha de la respuesta (reloj mal puesto) no distingue versiones: no es fuerte.
+    let data = payload(2 * 1024 * 1024);
+    let lm = "Wed, 21 Oct 2036 07:28:00 GMT";
+    let (addr, server) = start_with(data.clone(), true, 0, None, Some(lm)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let saved = Validators::new(None, Some(lm.into()), Some("Thu, 01 Jan 2026 00:00:00 GMT"));
+    assert!(!saved.lm_strong);
+    let (opts, chunks, _) = interrupted(dir.path(), "lmfuturo.bin", &data, &url, saved);
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(report.resumed, 0, "sin validador fuerte no se reanuda");
+    assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks);
+    assert_eq!(
+        std::fs::read(dir.path().join("lmfuturo.bin")).unwrap(),
+        data
+    );
 }

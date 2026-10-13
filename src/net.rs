@@ -73,6 +73,8 @@ pub struct Remote {
     pub ranges: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// `Date` de la respuesta: permite saber si `Last-Modified` es un validador fuerte.
+    pub date: Option<String>,
 }
 
 /// Crea el cliente. Los certificados vienen del almacén del sistema, que en Windows es el oficial.
@@ -137,6 +139,7 @@ pub async fn probe(
 
         let etag = header_string(headers, ETAG);
         let last_modified = header_string(headers, LAST_MODIFIED);
+        let date = header_string(headers, hyper::header::DATE);
 
         return match status {
             StatusCode::PARTIAL_CONTENT => {
@@ -151,6 +154,7 @@ pub async fn probe(
                     ranges: true,
                     etag,
                     last_modified,
+                    date,
                 })
             }
             StatusCode::OK => {
@@ -165,6 +169,7 @@ pub async fn probe(
                     ranges: false,
                     etag,
                     last_modified,
+                    date,
                 })
             }
             other => Err(Error::Status(other.as_u16())),
