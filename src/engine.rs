@@ -265,6 +265,7 @@ async fn segmented(
         control: control.clone(),
         url: remote.url.clone(),
         headers: headers.clone(),
+        total,
         if_range: validators.if_range().map(str::to_owned),
         pending,
         cursor: AtomicUsize::new(0),
@@ -402,6 +403,8 @@ struct Shared {
     control: Control,
     url: Uri,
     headers: HeaderMap,
+    /// Tamaño total del recurso: cada fragmento debe declararlo igual.
+    total: u64,
     /// Validador fuerte para `If-Range`.
     if_range: Option<String>,
     pending: Vec<Chunk>,
@@ -741,6 +744,7 @@ async fn fetch_with_retry(
             chunk,
             shared.if_range.as_deref(),
             &shared.headers,
+            shared.total,
             &[&shared.rx_bytes, flight_bytes],
             shared.limiter.as_deref(),
         )

@@ -149,6 +149,7 @@ pub async fn fetch_chunk(
     chunk: Chunk,
     etag: Option<&str>,
     extra: &HeaderMap,
+    total: u64,
     received: &[&std::sync::atomic::AtomicU64],
     limiter: Option<&crate::limits::RateLimiter>,
 ) -> Result<Bytes> {
@@ -171,6 +172,8 @@ pub async fn fetch_chunk(
     if status != StatusCode::PARTIAL_CONTENT {
         return Err(Error::RangeIgnored(status.as_u16()));
     }
+    // Un 206 con la longitud correcta pero de otra posición mezclaría el archivo sin que nada falle.
+    validate_content_range(resp.headers(), chunk, total)?;
 
     let expected = chunk.len();
     let mut body = resp.into_body();
@@ -232,6 +235,39 @@ fn header_string(headers: &hyper::HeaderMap, name: hyper::header::HeaderName) ->
         .map(str::to_owned)
 }
 
+/// `Content-Range: bytes inicio-fin/total` de un 206. El total puede ser `*` (desconocido).
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.trim().split_once('-')?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse().ok()?),
+    };
+    Some((start.trim().parse().ok()?, end.trim().parse().ok()?, total))
+}
+
+/// Exige que la respuesta cubra exactamente el fragmento pedido y que el recurso siga teniendo el
+/// mismo tamaño total.
+fn validate_content_range(headers: &HeaderMap, chunk: Chunk, total: u64) -> Result<()> {
+    let value = headers
+        .get(hyper::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::BadContentRange("falta la cabecera en un 206".into()))?;
+    let bad = |why: &str| Error::BadContentRange(format!("{value} ({why})"));
+    let (start, end, size) = parse_content_range(value).ok_or_else(|| bad("formato no válido"))?;
+    if (start, end) != (chunk.start, chunk.end) {
+        return Err(bad(&format!(
+            "se pidió {}-{} y el servidor entregó otra posición",
+            chunk.start, chunk.end
+        )));
+    }
+    if size.is_some_and(|size| size != total) {
+        return Err(bad(&format!("el recurso medía {total} bytes")));
+    }
+    Ok(())
+}
+
 /// Extrae el tamaño total de `bytes 0-0/12345`.
 fn parse_content_range_total(value: &str) -> Result<u64> {
     value
@@ -262,6 +298,57 @@ fn resolve(base: &Uri, location: &str) -> Result<Uri> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_range_de_un_fragmento() {
+        assert_eq!(
+            parse_content_range("bytes 5-9/100"),
+            Some((5, 9, Some(100)))
+        );
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
+        assert_eq!(
+            parse_content_range(" bytes  0-0 / 7 "),
+            Some((0, 0, Some(7)))
+        );
+        for bad in [
+            "",
+            "bytes */100",
+            "items 0-1/2",
+            "bytes a-b/c",
+            "bytes 5/100",
+            "5-9/100",
+        ] {
+            assert_eq!(parse_content_range(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn solo_se_acepta_el_rango_pedido_y_el_mismo_tamano() {
+        let chunk = Chunk {
+            index: 1,
+            start: 100,
+            end: 199,
+        };
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(hyper::header::CONTENT_RANGE, v.parse().unwrap());
+            h
+        };
+        assert!(validate_content_range(&with("bytes 100-199/1000"), chunk, 1000).is_ok());
+        assert!(validate_content_range(&with("bytes 100-199/*"), chunk, 1000).is_ok());
+        for bad in [
+            "bytes 99-198/1000",
+            "bytes 100-198/1000",
+            "bytes 100-199/1001",
+            "basura",
+        ] {
+            assert!(
+                validate_content_range(&with(bad), chunk, 1000).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(validate_content_range(&HeaderMap::new(), chunk, 1000).is_err());
+    }
 
     #[test]
     fn content_range_extrae_total() {
