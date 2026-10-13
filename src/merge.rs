@@ -77,7 +77,15 @@ fn ffmpeg_args(video: &Path, audio: &Path, tmp: &Path, format: &str) -> Vec<std:
 
 /// Descarga ambas pistas en paralelo y las une en `base.output`.
 /// `base` aporta conexiones, proxy, límite y progreso; su URL y cabeceras se ignoran.
+///
+/// El destino queda reservado (mismo bloqueo que una descarga directa) desde antes de elegir los
+/// intermedios hasta publicar y limpiar: dos trabajos sobre el mismo destino no comparten `.merging`.
 pub async fn download_merged(base: Options, job: MergeJob, control: Control) -> Result<Outcome> {
+    let _destination = engine::DestinationLock::acquire(&base.output).await?;
+    merge_locked(base, job, control).await
+}
+
+async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<Outcome> {
     let started = Instant::now();
     let output = base.output.clone();
     let video_file = with_suffix(&output, ".video");
@@ -106,9 +114,7 @@ pub async fn download_merged(base: Options, job: MergeJob, control: Control) -> 
 
     match (v, a) {
         (Outcome::Canceled, _) | (_, Outcome::Canceled) => {
-            for file in [&video_file, &audio_file] {
-                remove_track(file).await;
-            }
+            discard_tracks(&output).await?;
             Ok(Outcome::Canceled)
         }
         (Outcome::Paused { bytes: x }, Outcome::Paused { bytes: y }) => {
@@ -120,25 +126,31 @@ pub async fn download_merged(base: Options, job: MergeJob, control: Control) -> 
         }),
         (Outcome::Completed(rv), Outcome::Completed(ra)) => {
             let tmp = with_suffix(&output, ".merging");
-            let args = ffmpeg_args(&video_file, &audio_file, &tmp, container(&output));
-            let result = Command::new(&job.ffmpeg)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| Error::Video(format!("no se pudo ejecutar ffmpeg: {e}")))?;
-            if !result.status.success() {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let line = stderr.lines().rev().find(|l| !l.trim().is_empty());
-                // Las pistas se conservan: reintentar no vuelve a descargarlas.
-                return Err(Error::Video(format!(
-                    "ffmpeg no pudo unir las pistas: {}",
-                    line.unwrap_or("error desconocido").trim()
-                )));
+            match run_ffmpeg(&job, &video_file, &audio_file, &tmp, &output, &control).await? {
+                Joined::Interrupted => {
+                    // Sin publicar nada: pausar conserva las pistas; cancelar lo borra todo.
+                    engine::remove_if_exists(&tmp).await?;
+                    return if control.is_canceled() {
+                        discard_tracks(&output).await?;
+                        Ok(Outcome::Canceled)
+                    } else {
+                        Ok(Outcome::Paused {
+                            bytes: rv.bytes + ra.bytes,
+                        })
+                    };
+                }
+                Joined::Failed(message) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    // Las pistas se conservan: reintentar no vuelve a descargarlas.
+                    return Err(Error::Video(message));
+                }
+                Joined::Done => {}
+            }
+            // Una orden que llegó justo al terminar la unión también se respeta antes de publicar.
+            if control.is_canceled() {
+                engine::remove_if_exists(&tmp).await?;
+                discard_tracks(&output).await?;
+                return Ok(Outcome::Canceled);
             }
             tokio::fs::rename(&tmp, &output).await?;
             let bytes = tokio::fs::metadata(&output).await?.len();
@@ -155,6 +167,60 @@ pub async fn download_merged(base: Options, job: MergeJob, control: Control) -> 
             }))
         }
     }
+}
+
+enum Joined {
+    Done,
+    Failed(String),
+    Interrupted,
+}
+
+/// Ejecuta ffmpeg atendiendo el control: pausar o cancelar lo termina y lo espera antes de seguir.
+async fn run_ffmpeg(
+    job: &MergeJob,
+    video: &Path,
+    audio: &Path,
+    tmp: &Path,
+    output: &Path,
+    control: &Control,
+) -> Result<Joined> {
+    let args = ffmpeg_args(video, audio, tmp, container(output));
+    let mut child = Command::new(&job.ffmpeg)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| Error::Video(format!("no se pudo ejecutar ffmpeg: {e}")))?;
+    let mut stderr = child.stderr.take();
+    let collect = tokio::spawn(async move {
+        let mut text = Vec::new();
+        if let Some(pipe) = stderr.as_mut() {
+            use tokio::io::AsyncReadExt;
+            let _ = pipe.take(64 * 1024).read_to_end(&mut text).await;
+        }
+        text
+    });
+    let status = tokio::select! {
+        status = child.wait() => status.map_err(|e| Error::Video(format!("ffmpeg: {e}")))?,
+        _ = control.interrupted() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            collect.abort();
+            return Ok(Joined::Interrupted);
+        }
+    };
+    let stderr = collect.await.unwrap_or_default();
+    if status.success() {
+        return Ok(Joined::Done);
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    let line = stderr.lines().rev().find(|l| !l.trim().is_empty());
+    Ok(Joined::Failed(format!(
+        "ffmpeg no pudo unir las pistas: {}",
+        line.unwrap_or("error desconocido").trim()
+    )))
 }
 
 /// Descarga una pista; si ya está completa de una ejecución anterior, no la repite.
@@ -174,10 +240,43 @@ async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
     engine::download_controlled(opts, control).await
 }
 
-async fn remove_track(file: &Path) {
-    let _ = tokio::fs::remove_file(file).await;
-    let _ = tokio::fs::remove_file(with_suffix(file, ".part")).await;
-    let _ = tokio::fs::remove_file(with_suffix(file, ".part.state")).await;
+/// Borra las pistas, sus parciales y el temporal de unión de un destino. Ausente no es un fallo; el
+/// resto de errores se comunican (no se confirma una cancelación que dejó archivos).
+async fn discard_tracks(output: &Path) -> Result<()> {
+    let mut first: Option<std::io::Error> = None;
+    let video = with_suffix(output, ".video");
+    let audio = with_suffix(output, ".audio");
+    let files = [
+        video.clone(),
+        with_suffix(&video, ".part"),
+        with_suffix(&video, ".part.state"),
+        audio.clone(),
+        with_suffix(&audio, ".part"),
+        with_suffix(&audio, ".part.state"),
+        with_suffix(output, ".merging"),
+    ];
+    for file in files {
+        if let Err(e) = engine::remove_if_exists(&file).await {
+            first.get_or_insert(e);
+        }
+    }
+    match first {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+/// Cancela un trabajo compuesto que no está en curso: toma el destino y borra todo lo propio.
+pub async fn discard(output: &Path) -> Result<()> {
+    let destination = engine::DestinationLock::acquire(output).await?;
+    let tracks = discard_tracks(output).await;
+    let partials = {
+        let state = engine::remove_if_exists(&with_suffix(output, ".part.state")).await;
+        state.map_err(Error::from)
+    };
+    drop(destination);
+    tracks?;
+    partials
 }
 
 #[cfg(test)]

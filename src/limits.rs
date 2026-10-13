@@ -12,15 +12,19 @@ use std::time::{Duration, Instant};
 /// grande por encima del límite.
 const BURST: f64 = 0.25;
 
-struct Bucket {
-    tokens: f64,
-    at: Instant,
+/// Estado compartido: la velocidad y el instante en que se habrá pagado toda la deuda de bytes
+/// ya concedidos. Es el cubo de fichas expresado en tiempo: más sencillo de reescalar al cambiar la
+/// velocidad en caliente sin perder la contabilidad de lo ya repartido.
+struct Account {
+    /// Bytes por segundo; 0 significa sin límite.
+    rate: u64,
+    paid_at: Instant,
 }
 
 pub struct RateLimiter {
-    /// Bytes por segundo; 0 significa sin límite. Cambiable en caliente.
-    rate: Mutex<u64>,
-    bucket: Mutex<Bucket>,
+    account: Mutex<Account>,
+    /// Se avisa a las esperas en curso cada vez que cambia la velocidad.
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for RateLimiter {
@@ -32,49 +36,95 @@ impl std::fmt::Debug for RateLimiter {
 impl RateLimiter {
     pub fn new(bytes_per_sec: u64) -> Arc<Self> {
         Arc::new(Self {
-            rate: Mutex::new(bytes_per_sec),
-            bucket: Mutex::new(Bucket {
-                tokens: 0.0,
-                at: Instant::now(),
+            account: Mutex::new(Account {
+                rate: bytes_per_sec,
+                paid_at: Instant::now(),
             }),
+            changed: tokio::sync::watch::channel(0).0,
         })
     }
 
+    /// Cambia la velocidad. La deuda pendiente (bytes ya concedidos) se conserva y se reescala a la
+    /// nueva velocidad, y las esperas en curso la recalculan de inmediato.
     pub fn set_rate(&self, bytes_per_sec: u64) {
-        *self.rate.lock().unwrap_or_else(|e| e.into_inner()) = bytes_per_sec;
+        let now = Instant::now();
+        {
+            let mut a = self.lock();
+            if bytes_per_sec == 0 {
+                a.paid_at = now;
+            } else if a.rate > 0 {
+                let owed = a.paid_at.saturating_duration_since(now).as_secs_f64() * a.rate as f64;
+                a.paid_at = now + Duration::from_secs_f64(owed / bytes_per_sec as f64);
+            }
+            a.rate = bytes_per_sec;
+        }
+        self.changed.send_modify(|generation| *generation += 1);
     }
 
     pub fn rate(&self) -> u64 {
-        *self.rate.lock().unwrap_or_else(|e| e.into_inner())
+        self.lock().rate
     }
 
-    /// Descuenta `bytes` y devuelve cuánto esperar. Superar el cubo deja deuda, y la deuda es la espera.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Account> {
+        self.account.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Descuenta `bytes` y devuelve cuánto esperar. Superar la ráfaga deja deuda, y la deuda es la espera.
     pub fn take(&self, bytes: u64) -> Duration {
         self.take_at(bytes, Instant::now())
     }
 
     fn take_at(&self, bytes: u64, now: Instant) -> Duration {
-        let rate = self.rate() as f64;
-        if rate <= 0.0 {
-            return Duration::ZERO;
-        }
-        let mut b = self.bucket.lock().unwrap_or_else(|e| e.into_inner());
-        let refill = now.saturating_duration_since(b.at).as_secs_f64() * rate;
-        b.tokens = (b.tokens + refill).min(rate * BURST);
-        b.at = now.max(b.at);
-        b.tokens -= bytes as f64;
-        if b.tokens >= 0.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(-b.tokens / rate)
-        }
+        self.charge(bytes, now)
+            .map_or(Duration::ZERO, |(deadline, _)| {
+                deadline.saturating_duration_since(now)
+            })
     }
 
-    /// Espera lo necesario tras recibir `bytes`.
+    /// Concede `bytes`: devuelve el instante en que quedan pagados y la velocidad usada.
+    fn charge(&self, bytes: u64, now: Instant) -> Option<(Instant, u64)> {
+        let mut a = self.lock();
+        if a.rate == 0 {
+            return None;
+        }
+        // Un periodo de calma compra como mucho `BURST` segundos de velocidad.
+        let floor = now
+            .checked_sub(Duration::from_secs_f64(BURST))
+            .unwrap_or(now);
+        let start = a.paid_at.max(floor);
+        a.paid_at = start + Duration::from_secs_f64(bytes as f64 / a.rate as f64);
+        Some((a.paid_at, a.rate))
+    }
+
+    /// Espera lo necesario tras recibir `bytes`. Si la velocidad cambia mientras tanto, la espera
+    /// pendiente se recalcula (quitar el límite la corta en el acto).
     pub async fn throttle(&self, bytes: u64) {
-        let wait = self.take(bytes);
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        let mut changes = self.changed.subscribe();
+        let Some((mut deadline, mut rate)) = self.charge(bytes, Instant::now()) else {
+            return;
+        };
+        loop {
+            if deadline <= Instant::now() {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline.into()) => return,
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let now = self.rate();
+                    if now == 0 {
+                        return;
+                    }
+                    if now != rate {
+                        let owed = deadline.saturating_duration_since(Instant::now()).as_secs_f64()
+                            * rate as f64;
+                        deadline = Instant::now() + Duration::from_secs_f64(owed / now as f64);
+                        rate = now;
+                    }
+                }
+            }
         }
     }
 }
@@ -123,6 +173,59 @@ mod tests {
         let t1 = t0 + Duration::from_secs(10);
         assert_eq!(l.take_at(250_000, t1), Duration::ZERO);
         assert!(l.take_at(250_000, t1) > Duration::from_millis(240));
+    }
+
+    #[test]
+    fn quitar_el_limite_o_subirlo_corta_la_espera_en_curso() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 64 KiB a 1 KiB/s son unos 64 s de espera.
+            let l = RateLimiter::new(1024);
+            let waiting = {
+                let l = Arc::clone(&l);
+                tokio::spawn(async move { l.throttle(64 * 1024).await })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!waiting.is_finished());
+            let t = Instant::now();
+            l.set_rate(0);
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .expect("quitar el límite debe cortar la espera")
+                .unwrap();
+            assert!(t.elapsed() < Duration::from_secs(2));
+
+            // Subirlo reescala la deuda: 64 KiB pendientes a 64 KiB/s tardan ~1 s, no ~64 s.
+            let l = RateLimiter::new(1024);
+            let waiting = {
+                let l = Arc::clone(&l);
+                tokio::spawn(async move { l.throttle(64 * 1024).await })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let t = Instant::now();
+            l.set_rate(64 * 1024);
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("subir el límite debe acortar la espera")
+                .unwrap();
+            assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        });
+    }
+
+    #[test]
+    fn la_deuda_pendiente_sobrevive_al_cambio_de_velocidad() {
+        let l = RateLimiter::new(1_000_000);
+        let now = Instant::now();
+        // 1 MB concedido a 1 MB/s: ~1 s de deuda. Al duplicar la velocidad queda ~0,5 s.
+        let wait = l.take_at(1_000_000, now);
+        assert!((wait.as_secs_f64() - 1.0).abs() < 0.05, "{wait:?}");
+        l.set_rate(2_000_000);
+        let after = l.take_at(0, Instant::now());
+        assert!(after < Duration::from_millis(550), "{after:?}");
+        assert!(after > Duration::from_millis(300), "{after:?}");
     }
 
     #[test]

@@ -211,10 +211,46 @@ pub async fn discard_partials(output: &Path) -> Result<()> {
         state: with_suffix(output, ".part.state"),
     };
     let lock = open_locked(&paths.part).await?;
-    let _ = tokio::fs::remove_file(&paths.part).await;
-    let _ = tokio::fs::remove_file(&paths.state).await;
+    // Ausente no es un fallo; cualquier otro error (permisos, archivo en uso) se comunica.
+    let state = remove_if_exists(&paths.state).await;
     drop(lock);
+    let part = remove_if_exists(&paths.part).await;
+    state?;
+    part?;
     Ok(())
+}
+
+/// Exclusión del destino final de un trabajo compuesto (varias pistas, unión): toma el mismo bloqueo
+/// que una descarga directa sobre ese destino, así que ambas se excluyen mutuamente. Mientras se
+/// mantiene, nadie más toca el destino, sus intermedios ni su temporal de unión.
+pub struct DestinationLock {
+    file: Option<File>,
+    part: PathBuf,
+}
+
+impl DestinationLock {
+    /// `Error::Busy` si otra descarga o trabajo tiene el destino.
+    pub async fn acquire(output: &Path) -> Result<Self> {
+        let part = with_suffix(output, ".part");
+        let file = open_locked(&part).await?;
+        Ok(Self {
+            file: Some(file),
+            part,
+        })
+    }
+}
+
+impl Drop for DestinationLock {
+    fn drop(&mut self) {
+        // Suelta el bloqueo y no deja el marcador vacío (en Windows no se puede borrar abierto).
+        if let Some(file) = self.file.take() {
+            let empty = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+            drop(file);
+            if empty {
+                let _ = std::fs::remove_file(&self.part);
+            }
+        }
+    }
 }
 
 async fn run_locked(
@@ -230,8 +266,8 @@ async fn run_locked(
         _ = control.interrupted() => {
             // Somos los dueños del destino: cancelar limpia lo de una ejecución anterior; pausar lo conserva.
             if control.is_canceled() {
-                let _ = tokio::fs::remove_file(&paths.part).await;
-                let _ = tokio::fs::remove_file(&paths.state).await;
+                remove_if_exists(&paths.part).await?;
+                remove_if_exists(&paths.state).await?;
                 return Ok(Outcome::Canceled);
             }
             return Ok(Outcome::Paused { bytes: 0 });
@@ -1139,7 +1175,7 @@ async fn write_state_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn remove_if_exists(path: &Path) -> io::Result<()> {
+pub(crate) async fn remove_if_exists(path: &Path) -> io::Result<()> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),

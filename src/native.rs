@@ -226,6 +226,8 @@ where
                             state: State::Running,
                             bytes: 0,
                             via_ytdlp: false,
+                            merged: false,
+                            page: None,
                         },
                         job.headers.clone(),
                     );
@@ -266,17 +268,12 @@ where
             Ok(Incoming::Cancel { id }) => match registry.get(&id) {
                 Some(entry) if entry.record.state == State::Running => entry.control.cancel(),
                 Some(entry) if entry.record.state.is_resumable() => {
-                    if let Err(e) = crate::engine::discard_partials(&entry.record.path).await {
+                    if let Err(message) = discard_job(&entry.record, &out_dir).await {
                         let _ = tx.send(Outgoing::Error {
                             id,
-                            message: format!("no se puede cancelar ahora: {e}"),
+                            message: format!("no se puede cancelar ahora: {message}"),
                         });
                         continue;
-                    }
-                    if entry.record.via_ytdlp {
-                        let dir = entry.record.path.parent().unwrap_or(&out_dir);
-                        let _ =
-                            tokio::fs::remove_dir_all(crate::ytdlp::temp_dir_for(dir, &id)).await;
                     }
                     registry.update(&id, |e| e.record.state = State::Canceled);
                     persist(&registry, &out_dir, &tx);
@@ -305,6 +302,8 @@ where
                         control,
                         merge: entry.merge.clone(),
                         ytdlp: entry.record.via_ytdlp,
+                        merged: entry.record.merged,
+                        page: entry.record.page.clone(),
                     };
                     let _ = tx.send(Outgoing::Accepted {
                         id: id.clone(),
@@ -369,6 +368,10 @@ struct Job {
     merge: Option<crate::merge::MergeJob>,
     /// La descarga la hace yt-dlp desde la página (`url`).
     ytdlp: bool,
+    /// Es un vídeo con imagen y sonido separados. Si `merge` falta (cola recuperada tras reiniciar),
+    /// se vuelve a resolver `page` antes de empezar; nunca se baja solo la imagen.
+    merged: bool,
+    page: Option<String>,
 }
 
 /// Valida la petición antes de aceptarla: URL web, cabeceras permitidas y nombre seguro.
@@ -409,6 +412,8 @@ fn prepare(
         control: Control::default(),
         merge: None,
         ytdlp: false,
+        merged: false,
+        page: None,
     })
 }
 
@@ -442,6 +447,15 @@ async fn run_video(
         }
     };
     // El contenedor de un vídeo delegado lo decide yt-dlp: se reservan todas las extensiones posibles.
+    // Con sonido aparte hace falta ffmpeg: sin él no se baja solo la imagen como si fuera el vídeo.
+    if choice.audio.is_some() && ffmpeg.is_none() {
+        let _ = tx.send(Outgoing::Error {
+            id,
+            message: "este vídeo trae el sonido aparte y no se encontró ffmpeg para unirlo".into(),
+        });
+        return;
+    }
+    let merged = choice.audio.is_some();
     let alternatives: &[&str] = if choice.via_ytdlp {
         &["mp4", "mkv", "webm", "mov"]
     } else {
@@ -477,33 +491,13 @@ async fn run_video(
             state: State::Running,
             bytes: 0,
             via_ytdlp: choice.via_ytdlp,
+            merged,
+            page: Some(page.clone()),
         },
         headers.clone(),
     );
-    // Con sonido aparte hace falta ffmpeg; `probe` ya garantiza que existe si devuelve una pareja.
     let merge = match (choice.audio, ffmpeg) {
-        (Some(audio), Some(ffmpeg)) => {
-            let mut audio_headers = HeaderMap::new();
-            for (name, value) in &audio.headers {
-                if let (Ok(n), Ok(v)) = (
-                    HeaderName::from_bytes(name.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    audio_headers.append(n, v);
-                }
-            }
-            Some(crate::merge::MergeJob {
-                video: crate::merge::Track {
-                    url: choice.url.clone(),
-                    headers: headers.clone(),
-                },
-                audio: crate::merge::Track {
-                    url: audio.url,
-                    headers: audio_headers,
-                },
-                ffmpeg,
-            })
-        }
+        (Some(audio), Some(ffmpeg)) => Some(merge_job(&choice.url, &headers, audio, ffmpeg)),
         _ => None,
     };
     registry.update(&id, |e| e.merge = merge.clone());
@@ -515,8 +509,90 @@ async fn run_video(
         control,
         merge,
         ytdlp: choice.via_ytdlp,
+        merged,
+        page: Some(page),
     };
     run(job, tx, registry, out_dir, limiter).await;
+}
+
+/// Borra todo lo propio de un trabajo que no está en curso, según su tipo, tomando antes la exclusión
+/// del destino. Los errores (salvo «no existe») se comunican: no se confirma una cancelación que dejó restos.
+async fn discard_job(record: &Record, out_dir: &Path) -> Result<(), String> {
+    if record.merged {
+        crate::merge::discard(&record.path)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        crate::engine::discard_partials(&record.path)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if record.via_ytdlp {
+        let dir = record.path.parent().unwrap_or(out_dir);
+        match tokio::fs::remove_dir_all(crate::ytdlp::temp_dir_for(dir, &record.id)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn header_map(pairs: &[(String, String)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in pairs {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            map.append(n, v);
+        }
+    }
+    map
+}
+
+fn merge_job(
+    video_url: &str,
+    video_headers: &HeaderMap,
+    audio: crate::video::AudioPart,
+    ffmpeg: PathBuf,
+) -> crate::merge::MergeJob {
+    crate::merge::MergeJob {
+        video: crate::merge::Track {
+            url: video_url.to_owned(),
+            headers: video_headers.clone(),
+        },
+        audio: crate::merge::Track {
+            url: audio.url,
+            headers: header_map(&audio.headers),
+        },
+        ffmpeg,
+    }
+}
+
+/// Vuelve a resolver la página de un vídeo con pistas separadas (los enlaces firmados caducan y no se
+/// guardan). Falla si ya no hay pareja imagen+sonido: reanudar nunca degrada a descargar solo la imagen.
+async fn resolve_merge(page: &str) -> Result<crate::merge::MergeJob, String> {
+    let ffmpeg = crate::video::find_ffmpeg().await;
+    let opts = crate::video::ProbeOptions {
+        python: crate::video::default_python(),
+        cookies: None,
+        ffmpeg: ffmpeg.clone(),
+    };
+    let choice = crate::video::probe(page, &opts)
+        .await
+        .map_err(|e| format!("no se pudo volver a resolver el vídeo: {e}"))?;
+    match (choice.audio, ffmpeg) {
+        (Some(audio), Some(ffmpeg)) if !choice.via_ytdlp => {
+            let headers = header_map(&choice.headers);
+            Ok(merge_job(&choice.url, &headers, audio, ffmpeg))
+        }
+        _ => Err(
+            "no se pudo reanudar: la página ya no ofrece imagen y sonido por separado (o falta \
+             ffmpeg); vuelve a añadir el vídeo"
+                .into(),
+        ),
+    }
 }
 
 /// Ejecuta una descarga controlada y deja su resultado en la cola (y en disco).
@@ -556,9 +632,22 @@ async fn run(
     opts.progress = Some(Arc::clone(&progress));
     opts.limiter = Some(limiter);
 
-    let result = match job.merge {
-        Some(merge) => crate::merge::download_merged(opts, merge, job.control).await,
-        None => engine::download_controlled(opts, job.control).await,
+    let merge = match (job.merge, job.merged) {
+        (Some(merge), _) => Ok(Some(merge)),
+        (None, false) => Ok(None),
+        // Vídeo con pistas separadas recuperado tras reiniciar: los enlaces no se guardaron.
+        (None, true) => match job.page.as_deref() {
+            Some(page) => resolve_merge(page).await.map(|merge| {
+                registry.update(&job.id, |e| e.merge = Some(merge.clone()));
+                Some(merge)
+            }),
+            None => Err("no se puede reanudar: falta la página de origen del vídeo".into()),
+        },
+    };
+    let result = match merge {
+        Ok(Some(merge)) => crate::merge::download_merged(opts, merge, job.control).await,
+        Ok(None) => engine::download_controlled(opts, job.control).await,
+        Err(message) => Err(crate::error::Error::Video(message)),
     };
     reporter.abort();
 
@@ -645,6 +734,8 @@ pub async fn run_pending(out_dir: PathBuf) -> crate::error::Result<crate::schedu
             control,
             merge: None,
             ytdlp: record.via_ytdlp,
+            merged: record.merged,
+            page: record.page,
         };
         let (slots, tx, registry, out_dir, limiter) = (
             Arc::clone(&slots),
@@ -713,6 +804,8 @@ async fn run_ytdlp(
             "falta el entorno de yt-dlp: ejecuta w11dl-host setup".into(),
         )),
         Some(python) => {
+            // Mismo bloqueo de destino que cualquier otra descarga: dos trabajos no comparten nombre.
+            let destination = crate::engine::DestinationLock::acquire(&job.output).await;
             let dir = job.output.parent().unwrap_or(&out_dir).to_path_buf();
             let ytdlp_job = crate::ytdlp::YtDlpJob {
                 python,
@@ -728,7 +821,12 @@ async fn run_ytdlp(
                 rate_limit: limiter.rate(),
                 cookies: None,
             };
-            crate::ytdlp::download(&ytdlp_job, job.control.clone(), Some(progress)).await
+            match destination {
+                Ok(_held) => {
+                    crate::ytdlp::download(&ytdlp_job, job.control.clone(), Some(progress)).await
+                }
+                Err(e) => Err(e),
+            }
         }
     };
     reporter.abort();

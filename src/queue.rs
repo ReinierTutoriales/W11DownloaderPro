@@ -81,6 +81,14 @@ pub struct Record {
     /// Se persiste para poder retomarla tras reiniciar, porque yt-dlp vuelve a resolver el enlace.
     #[serde(default)]
     pub via_ytdlp: bool,
+    /// Imagen y sonido en pistas separadas que se unen con ffmpeg. Los enlaces de cada pista caducan
+    /// y no se guardan: para reanudar se vuelve a resolver `page`, y si no se puede, falla (nunca
+    /// se baja solo la imagen como si fuera el vídeo completo).
+    #[serde(default)]
+    pub merged: bool,
+    /// Página de origen de un vídeo resuelto por el host; permite volver a resolverlo.
+    #[serde(default)]
+    pub page: Option<String>,
 }
 
 /// Entrada en memoria: el registro, el control activo y las cabeceras de sesión (solo en memoria).
@@ -113,7 +121,22 @@ struct Inner {
 struct Shared {
     entries: Vec<Entry>,
     /// Destinos ya adjudicados cuya descarga aún no se ha registrado.
-    reserved: HashSet<PathBuf>,
+    reserved: HashSet<String>,
+}
+
+/// Identidad de un destino para detectar conflictos: en Windows `Video.mp4` y `video.mp4` son el mismo
+/// archivo, así que se comparan sin distinguir mayúsculas.
+fn identity(path: &Path) -> String {
+    identity_with(path, cfg!(windows))
+}
+
+fn identity_with(path: &Path, case_insensitive: bool) -> String {
+    let text = path.to_string_lossy();
+    if case_insensitive {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
+    }
 }
 
 impl Registry {
@@ -184,11 +207,11 @@ impl Registry {
                     || crate::naming::with_suffix(p, ".part.state").exists()
             };
             let held = |p: &Path| {
-                shared.reserved.contains(p)
-                    || shared
-                        .entries
-                        .iter()
-                        .any(|e| e.record.path == p && e.record.state != State::Canceled)
+                let id = identity(p);
+                shared.reserved.contains(&id)
+                    || shared.entries.iter().any(|e| {
+                        identity(&e.record.path) == id && e.record.state != State::Canceled
+                    })
             };
             std::iter::once(candidate.to_path_buf())
                 .chain(also_exts.iter().map(|e| candidate.with_extension(e)))
@@ -202,13 +225,13 @@ impl Registry {
             }
             n += 1;
         };
-        shared.reserved.insert(path.clone());
+        shared.reserved.insert(identity(&path));
         path
     }
 
     /// Devuelve un destino reservado que al final no se usó.
     pub fn release_path(&self, path: &Path) {
-        self.lock().reserved.remove(path);
+        self.lock().reserved.remove(&identity(path));
     }
 
     /// Añade una descarga en curso y devuelve su control.
@@ -221,7 +244,7 @@ impl Registry {
             merge: None,
         };
         let mut shared = self.lock();
-        shared.reserved.remove(&entry.record.path);
+        shared.reserved.remove(&identity(&entry.record.path));
         shared.entries.push(entry);
         control
     }
@@ -305,6 +328,8 @@ mod tests {
             state,
             bytes: 7,
             via_ytdlp: false,
+            merged: false,
+            page: None,
         }
     }
 
@@ -332,6 +357,24 @@ mod tests {
         reg.save(dir.path()).unwrap();
         let text = std::fs::read_to_string(dir.path().join(QUEUE_FILE)).unwrap();
         assert!(!text.contains("secreto") && !text.to_lowercase().contains("cookie"));
+    }
+
+    #[test]
+    fn la_identidad_de_un_destino_ignora_mayusculas_donde_el_sistema_lo_hace() {
+        let (a, b) = (Path::new("D/Video.mp4"), Path::new("D/video.MP4"));
+        assert_eq!(identity_with(a, true), identity_with(b, true));
+        assert_ne!(identity_with(a, false), identity_with(b, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn en_windows_no_se_adjudican_dos_nombres_que_solo_difieren_en_mayusculas() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::default();
+        let first = reg.claim_path(dir.path(), "Video.mp4", &[]);
+        let second = reg.claim_path(dir.path(), "video.mp4", &[]);
+        assert_ne!(identity(&first), identity(&second), "{first:?} {second:?}");
+        assert_ne!(first, second);
     }
 
     #[test]
