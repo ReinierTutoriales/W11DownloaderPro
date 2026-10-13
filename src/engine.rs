@@ -675,11 +675,7 @@ async fn run_worker(shared: Arc<Shared>) -> Result<()> {
             return Ok(());
         }
         // Si el motor bajó el objetivo, este trabajador se retira tras su fragmento actual.
-        if shared
-            .retire
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| r.checked_sub(1))
-            .is_ok()
-        {
+        if take_one(&shared.retire) {
             return Ok(());
         }
         let (chunk, flight, role) = match shared.take_chunk() {
@@ -804,6 +800,24 @@ async fn fetch_with_retry(
             }
         }
     }
+}
+
+/// Descuenta una unidad del contador si queda alguna. Bucle de comparar-e-intercambiar: así no depende del
+/// nombre del método de la biblioteca estándar (`fetch_update` pasa a llamarse `try_update`).
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut current = counter.load(Ordering::SeqCst);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
 }
 
 /// Persiste estado solo después de sincronizar datos: un fragmento marcado como hecho
@@ -1051,6 +1065,23 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_one_descuenta_sin_pasar_de_cero_ni_perder_unidades() {
+        let counter = Arc::new(AtomicUsize::new(100));
+        let taken: usize = (0..8)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || (0..40).filter(|_| take_one(&counter)).count())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        assert_eq!(taken, 100, "se reparten exactamente las 100 unidades");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert!(!take_one(&counter));
+    }
 
     #[test]
     fn las_cabeceras_de_sesion_no_siguen_una_degradacion_a_http() {
