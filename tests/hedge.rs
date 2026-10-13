@@ -37,7 +37,10 @@ async fn run(slow_every: usize) -> (Duration, usize, bool) {
 
 #[tokio::test]
 async fn fragmentos_lentos_se_copian_y_el_archivo_es_identico() {
-    let (slow, copies, identical) = run(6).await;
+    // 16 fragmentos de 1 MiB: el 16.º (el último) es el lento. Que el lento esté al final es lo que hace
+    // determinista la prueba: con la cola ya vacía y otras conexiones libres, hay un rezagado que copiar,
+    // sea cual sea la velocidad del equipo.
+    let (slow, copies, identical) = run(16).await;
     let (clean, clean_copies, clean_identical) = run(0).await;
     eprintln!(
         "[hedge] con lentos: {slow:?} copias={copies}; sin lentos: {clean:?} copias={clean_copies}"
