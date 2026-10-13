@@ -79,7 +79,7 @@ Sin ffmpeg no se delega ni se une (explica la dependencia con enlace).
 
 | Conjunto | Resultado de la última ejecución |
 |---|---|
-| Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 165 pasan, 0 fallan |
+| Rust (`cargo test`, con `W11DL_PYTHON` y ffmpeg) | 173 pasan, 0 fallan |
 | Extensión (`npm test`) | 24 pasan, 1 omitida (vídeo, requiere `W11DL_PYTHON`) |
 | Botón en Chromium con Playwright (`test/video-button.dom.js`) | 6 comprobaciones OK |
 | `cargo clippy --all-targets -- -D warnings` | sin avisos |
@@ -133,6 +133,19 @@ Cada hallazgo se comprobó leyendo el código y, cuando fue posible, **reproduci
 Hallazgos propios de esta ronda: en Unix, el yt-dlp autónomo dejaba un proceso hijo vivo al cancelar (prueba intermitente), ahora se mata el grupo de procesos entero; clippy más estricto con Rust 1.89 (mínimo actualizado).
 Se añadió a la CI un trabajo `calidad`: `cargo fmt --check`, `cargo clippy -D warnings` y `cargo audit` (RustSec). **`cargo audit` ejecutado localmente: 0 vulnerabilidades en 194 dependencias** (base de avisos de hoy).
 Siguen sin verificarse: los efectos del bloqueo de archivos de Windows (mandatorio) en la CI de Windows de esta rama, y todo lo de la sección 8.
+
+## 7 ter. Revisión cruzada 2 (segunda ronda, contrastada igual que la primera)
+
+| # | Hallazgo | Comprobación | Corrección | Prueba |
+|---|---|---|---|---|
+| A | El bloqueo del parcial se soltaba antes de verificar y publicar | **Reproducido**: una segunda descarga entraba mientras la primera calculaba el hash (96 MiB) y descargaba todo de nuevo | El bloqueo se toma al empezar, **antes de leer el estado o la longitud**, y se mantiene hasta publicar y limpiar; el hash se lee por el mismo manejador (en Windows el bloqueo es obligatorio) | `tests/ciclo.rs` |
+| B | Dos procesos con la misma cola (host del navegador y `run-queue`) | **Reproducido con procesos reales**: no había exclusión alguna | Un propietario por carpeta (`.w11dl-queue.lock`): `run-queue` se niega con código 2 y sin acción final; un segundo host funciona pero no guarda la cola y avisa una vez; la tarea de Windows reintenta cada 10 min (sin verificar en Windows) | `tests/procesos.rs` |
+| C | `throttle` fuera del `select!` en la descarga sin rangos | **Reproducido**: cancelar con 1 KiB/s no respondía | La espera del limitador compite con el control | `sin_rangos_cancelar_corta…` |
+| D | Cancelar durante el sondeo no limpiaba el parcial previo | **Reproducido** | Con el destino bloqueado, cancelar borra los restos propios; pausar los conserva; quien no es dueño (`Busy`) no borra nada | `cancelar_durante_el_sondeo…`, `cancelar_una_descarga_rechazada…` |
+| E | Fechas HTTP inválidas aceptadas; política de confianza en `Last-Modified` | Confirmado: se aceptaban días inexistentes de un mes y horas sin validar el ancho | Gramática estricta (ancho fijo, solo dígitos, bisiestos, día de la semana coherente) y margen de 60 s entre `Date` y `Last-Modified`: origen y CDN pueden tener relojes distintos, así que ante la duda no se fía | `fechas_http_invalidas…`, `last_modified_es_fuerte_solo_con_margen…` |
+
+Coste asumido de E: un archivo modificado hace menos de un minuto no se reanuda sin SHA-256 (se pierde progreso, no integridad).
+Pendiente de verificar: el comportamiento de estos bloqueos y de `RestartOnFailure` en la CI y en un Windows 11 de escritorio.
 
 ## 8. No verificado
 
