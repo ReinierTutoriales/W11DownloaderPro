@@ -20,6 +20,9 @@ pub enum Error {
     #[error("cabecera Content-Range inconsistente: {0}")]
     BadContentRange(String),
 
+    #[error("otra descarga ya está escribiendo en este archivo: {0}")]
+    Busy(String),
+
     #[error("el servidor no envió nada durante {0}")]
     Timeout(String),
 

@@ -84,3 +84,39 @@ async fn un_parcial_de_otra_descarga_tambien_ocupa_el_nombre() {
         "el parcial ajeno no se toca"
     );
 }
+
+mod ranged;
+
+#[tokio::test]
+async fn dos_descargas_a_la_misma_ruta_no_se_pisan() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use w11dl::{Error, Options, download};
+
+    // 8 MiB a unos 64 KiB cada 8 ms por conexión: la primera tarda lo suficiente para solaparse con la segunda.
+    let data = ranged::payload(8 << 20);
+    let addr = ranged::ranged(Arc::new(data.clone()), Duration::from_millis(8), 0, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("compartido.bin");
+    let make = || {
+        let mut opts = Options::new(format!("http://{addr}/f.bin"), out.clone());
+        opts.connections = 4;
+        opts.max_chunk = 512 * 1024;
+        opts
+    };
+
+    let first = tokio::spawn(download(make()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = download(make()).await;
+
+    assert!(
+        matches!(second, Err(Error::Busy(_))),
+        "la segunda debe rechazarse: {second:?}"
+    );
+    first.await.unwrap().expect("la primera debe terminar bien");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "el archivo no debe haberse corrompido"
+    );
+}

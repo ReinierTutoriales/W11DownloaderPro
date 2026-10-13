@@ -163,9 +163,7 @@ where
     let limiter = RateLimiter::new(settings::load_limit(&out_dir));
     let mut jobs = tokio::task::JoinSet::new();
     let registry = Registry::load(&out_dir);
-    if let Err(e) = registry.save(&out_dir) {
-        eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
-    }
+    persist(&registry, &out_dir, &tx);
 
     while let Some(raw) = read_message(&mut input).await? {
         match serde_json::from_slice::<Incoming>(&raw) {
@@ -221,10 +219,10 @@ where
                         },
                         job.headers.clone(),
                     );
-                    let _ = registry.save(&out_dir);
+                    persist(&registry, &out_dir, &tx);
                     if queued {
                         registry.update(&id, |e| e.record.state = State::Queued);
-                        let _ = registry.save(&out_dir);
+                        persist(&registry, &out_dir, &tx);
                         continue;
                     }
                     let slots = Arc::clone(&slots);
@@ -265,7 +263,7 @@ where
                             tokio::fs::remove_dir_all(crate::ytdlp::temp_dir_for(dir, &id)).await;
                     }
                     registry.update(&id, |e| e.record.state = State::Canceled);
-                    let _ = registry.save(&out_dir);
+                    persist(&registry, &out_dir, &tx);
                     let _ = tx.send(Outgoing::Canceled { id });
                 }
                 _ => {
@@ -282,7 +280,7 @@ where
                         e.control = control.clone();
                         e.record.state = State::Running;
                     });
-                    let _ = registry.save(&out_dir);
+                    persist(&registry, &out_dir, &tx);
                     let job = Job {
                         id: id.clone(),
                         url: entry.record.url.clone(),
@@ -587,9 +585,7 @@ async fn run(
             }
         }
     };
-    if let Err(e) = registry.save(&out_dir) {
-        eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
-    }
+    persist(&registry, &out_dir, &tx);
     let _ = tx.send(message);
 }
 
@@ -637,7 +633,7 @@ pub async fn run_pending(out_dir: PathBuf) -> crate::schedule::Summary {
             run(job, tx, registry, out_dir, limiter).await;
         });
     }
-    let _ = registry.save(&out_dir);
+    persist(&registry, &out_dir, &tx);
     while jobs.join_next().await.is_some() {}
 
     let mut summary = crate::schedule::Summary::default();
@@ -744,9 +740,7 @@ async fn run_ytdlp(
         }
         Err(e) => failed(&registry, &job.id, &e.to_string()),
     };
-    if let Err(e) = registry.save(&out_dir) {
-        eprintln!("w11dl-host: no se pudo guardar la cola: {e}");
-    }
+    persist(&registry, &out_dir, &tx);
     let _ = tx.send(message);
 }
 
@@ -759,6 +753,17 @@ fn failed(registry: &Registry, id: &str, message: &str) -> Outgoing {
     Outgoing::Error {
         id: id.to_owned(),
         message: message.to_owned(),
+    }
+}
+
+/// Guarda la cola y, si empieza a fallar, lo comunica a la extensión además de registrarlo.
+fn persist(registry: &Registry, dir: &Path, tx: &mpsc::UnboundedSender<Outgoing>) {
+    if let Some(message) = registry.save_notice(dir) {
+        eprintln!("w11dl-host: {message}");
+        let _ = tx.send(Outgoing::Error {
+            id: String::new(),
+            message,
+        });
     }
 }
 

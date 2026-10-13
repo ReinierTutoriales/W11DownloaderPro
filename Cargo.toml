@@ -2,7 +2,7 @@
 name = "w11dl"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "UNLICENSED"
 description = "Motor de descargas acelerado para Windows 11"
 publish = false

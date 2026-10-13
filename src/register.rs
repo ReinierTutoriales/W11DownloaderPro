@@ -70,21 +70,21 @@ pub fn register(
             "indica --extension-id o --firefox-id",
         ));
     }
-    if let Some(id) = &targets.chromium_id {
-        if !valid_chromium_id(id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ID de extensión de Chromium no válido",
-            ));
-        }
+    if let Some(id) = &targets.chromium_id
+        && !valid_chromium_id(id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ID de extensión de Chromium no válido",
+        ));
     }
-    if let Some(id) = &targets.firefox_id {
-        if !valid_firefox_id(id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ID de extensión de Firefox no válido",
-            ));
-        }
+    if let Some(id) = &targets.firefox_id
+        && !valid_firefox_id(id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ID de extensión de Firefox no válido",
+        ));
     }
 
     std::fs::create_dir_all(manifest_dir)?;

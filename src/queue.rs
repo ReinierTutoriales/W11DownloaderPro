@@ -77,6 +77,8 @@ struct Inner {
     shared: Mutex<Shared>,
     /// Un solo guardado a la vez: comparten archivo temporal y el más reciente debe ser el último.
     save_lock: Mutex<()>,
+    /// El último guardado falló: evita repetir el mismo aviso en cada intento.
+    save_failing: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -112,6 +114,7 @@ impl Registry {
                 reserved: HashSet::new(),
             }),
             save_lock: Mutex::new(()),
+            save_failing: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -210,6 +213,23 @@ impl Registry {
         std::fs::rename(&tmp, &target)
     }
 
+    /// Guarda y devuelve un aviso solo cuando el guardado empieza a fallar (no en cada reintento), para
+    /// que el usuario sepa que la cola no se está persistiendo sin recibir el mismo error una y otra vez.
+    pub fn save_notice(&self, dir: &Path) -> Option<String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.save(dir) {
+            Ok(()) => {
+                self.0.save_failing.store(false, SeqCst);
+                None
+            }
+            Err(e) if !self.0.save_failing.swap(true, SeqCst) => Some(format!(
+                "no se pudo guardar la cola de descargas en {}: {e}",
+                dir.display()
+            )),
+            Err(_) => None,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
         self.0
             .shared
@@ -266,6 +286,27 @@ mod tests {
         assert!(State::Interrupted.is_resumable());
         assert!(!State::Running.is_resumable());
         assert!(!State::Done.is_resumable());
+    }
+
+    #[test]
+    fn un_guardado_que_falla_avisa_una_vez_hasta_que_se_recupere() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("no-existe");
+        let reg = Registry::default();
+        reg.insert(record("a", State::Running), HeaderMap::new());
+        let first = reg.save_notice(&missing);
+        assert!(
+            first.is_some_and(|m| m.contains("no se pudo guardar")),
+            "debe avisar la primera vez"
+        );
+        assert_eq!(reg.save_notice(&missing), None, "no repite el aviso");
+        std::fs::create_dir(&missing).unwrap();
+        assert_eq!(reg.save_notice(&missing), None, "recuperado: sin aviso");
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert!(
+            reg.save_notice(&missing).is_some(),
+            "un fallo nuevo vuelve a avisar"
+        );
     }
 
     #[test]

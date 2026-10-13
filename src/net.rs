@@ -343,10 +343,11 @@ fn parse_content_range_total(value: &str) -> Result<u64> {
 
 /// Resuelve una cabecera `Location` (absoluta o relativa) contra la URL actual.
 fn resolve(base: &Uri, location: &str) -> Result<Uri> {
-    if let Ok(abs) = location.parse::<Uri>() {
-        if abs.scheme().is_some() && abs.authority().is_some() {
-            return parse_url(&abs.to_string());
-        }
+    if let Ok(abs) = location.parse::<Uri>()
+        && abs.scheme().is_some()
+        && abs.authority().is_some()
+    {
+        return parse_url(&abs.to_string());
     }
     let scheme = base.scheme_str().unwrap_or("https");
     let authority = base.authority().map(|a| a.as_str()).unwrap_or_default();

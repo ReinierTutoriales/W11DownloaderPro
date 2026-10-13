@@ -70,16 +70,14 @@ async fn run_queue(args: &[String]) -> ExitCode {
         "Cola terminada: {} completadas, {} con error, {} sin terminar.",
         summary.done, summary.failed, summary.canceled
     );
-    if schedule::should_run_after(&summary) {
-        if let Some((program, program_args)) = after.command() {
-            if let Err(e) = std::process::Command::new(program)
-                .args(program_args)
-                .status()
-            {
-                eprintln!("w11dl-host: no se pudo ejecutar {program}: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+    if schedule::should_run_after(&summary)
+        && let Some((program, program_args)) = after.command()
+        && let Err(e) = std::process::Command::new(program)
+            .args(program_args)
+            .status()
+    {
+        eprintln!("w11dl-host: no se pudo ejecutar {program}: {e}");
+        return ExitCode::FAILURE;
     }
     if summary.failed == 0 && summary.canceled == 0 {
         ExitCode::SUCCESS

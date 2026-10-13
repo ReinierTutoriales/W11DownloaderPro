@@ -369,8 +369,8 @@ async fn segmented(
                 if ceiling.tick(now_ms) {
                     changed = true;
                 }
-                if !controller.settled() {
-                    if let Some(rate) = sampler.sample(shared.rx_bytes.load(Ordering::Relaxed)) {
+                if !controller.settled()
+                    && let Some(rate) = sampler.sample(shared.rx_bytes.load(Ordering::Relaxed)) {
                         let conns_before = controller.conns();
                         let step = controller.observe(rate);
                         if trace {
@@ -387,7 +387,6 @@ async fn segmented(
                             changed = true;
                         }
                     }
-                }
                 if changed {
                     apply_target(&mut set, &shared, controller.conns().min(ceiling.cap()));
                     peak = peak.max(shared.live.load(Ordering::Relaxed));
@@ -836,7 +835,22 @@ async fn single(
         _ = control.interrupted() => return Ok(Step::Interrupted { bytes: 0 }),
     };
     let mut body = resp.into_body();
-    let mut file = tokio::fs::File::create(part).await?;
+    let mut file = {
+        let part = part.to_path_buf();
+        let std_file = tokio::task::spawn_blocking(move || -> Result<File> {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&part)?;
+            lock_exclusive(&file, &part)?;
+            file.set_len(0)?;
+            Ok(file)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        tokio::fs::File::from_std(std_file)
+    };
 
     let mut written = 0u64;
     loop {
@@ -880,13 +894,13 @@ async fn single(
     }
     file.sync_all().await?;
 
-    if let Some(total) = remote.total {
-        if total != written {
-            return Err(Error::Truncated {
-                expected: total,
-                received: written,
-            });
-        }
+    if let Some(total) = remote.total
+        && total != written
+    {
+        return Err(Error::Truncated {
+            expected: total,
+            received: written,
+        });
     }
 
     Ok(Step::Finished(Transfer {
@@ -897,22 +911,36 @@ async fn single(
     }))
 }
 
-async fn open_part(part: &Path, fresh: bool, total: u64) -> io::Result<File> {
+/// Abre el parcial con bloqueo exclusivo del sistema, que se mantiene mientras viva el manejador (y
+/// desaparece solo si el proceso muere). Dos descargas a la misma ruta no pueden escribir a la vez:
+/// la segunda recibe `Error::Busy` sin tocar el archivo. Solo se trunca o redimensiona con el bloqueo ya
+/// tomado, para no destrozar el parcial de otra descarga en curso.
+async fn open_part(part: &Path, fresh: bool, total: u64) -> Result<File> {
     let part = part.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(fresh)
+            .truncate(false)
             .open(&part)?;
+        lock_exclusive(&file, &part)?;
         if fresh {
+            file.set_len(0)?;
             file.set_len(total)?;
         }
         Ok(file)
     })
     .await
     .map_err(io::Error::other)?
+}
+
+fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy(path.display().to_string())),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
