@@ -3,6 +3,7 @@
 //! Se guarda en disco solo lo necesario para retomar: URL, ruta y estado. Las cabeceras de sesión
 //! (cookies) se quedan en memoria: no se escriben nunca en disco.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -69,7 +70,21 @@ pub struct Entry {
 
 /// Cola compartida por las tareas del host.
 #[derive(Clone, Default)]
-pub struct Registry(Arc<Mutex<Vec<Entry>>>);
+pub struct Registry(Arc<Inner>);
+
+#[derive(Default)]
+struct Inner {
+    shared: Mutex<Shared>,
+    /// Un solo guardado a la vez: comparten archivo temporal y el más reciente debe ser el último.
+    save_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct Shared {
+    entries: Vec<Entry>,
+    /// Destinos ya adjudicados cuya descarga aún no se ha registrado.
+    reserved: HashSet<PathBuf>,
+}
 
 impl Registry {
     /// Carga la cola guardada. Lo que estaba en curso queda como `Interrupted`; lo pausado sigue pausado.
@@ -91,7 +106,56 @@ impl Registry {
                 }
             })
             .collect();
-        Self(Arc::new(Mutex::new(entries)))
+        Self(Arc::new(Inner {
+            shared: Mutex::new(Shared {
+                entries,
+                reserved: HashSet::new(),
+            }),
+            save_lock: Mutex::new(()),
+        }))
+    }
+
+    /// Adjudica un destino libre en `dir` y lo reserva hasta que se registre la descarga.
+    ///
+    /// Un nombre está ocupado si existe el archivo, su parcial o su estado, si otra descarga de la
+    /// cola (en espera, en curso, pausada o terminada) lo tiene, o si ya se adjudicó a otra
+    /// petición. `also_exts` añade extensiones que el mismo nombre podría acabar teniendo (el
+    /// contenedor de un vídeo lo decide yt-dlp). Comprobar y reservar es una sola operación: dos
+    /// peticiones simultáneas nunca reciben el mismo destino.
+    pub fn claim_path(&self, dir: &Path, filename: &str, also_exts: &[&str]) -> PathBuf {
+        let mut shared = self.lock();
+        let taken = |shared: &Shared, candidate: &Path| {
+            let on_disk = |p: &Path| {
+                p.exists()
+                    || crate::naming::with_suffix(p, ".part").exists()
+                    || crate::naming::with_suffix(p, ".part.state").exists()
+            };
+            let held = |p: &Path| {
+                shared.reserved.contains(p)
+                    || shared
+                        .entries
+                        .iter()
+                        .any(|e| e.record.path == p && e.record.state != State::Canceled)
+            };
+            std::iter::once(candidate.to_path_buf())
+                .chain(also_exts.iter().map(|e| candidate.with_extension(e)))
+                .any(|p| on_disk(&p) || held(&p))
+        };
+        let mut n = 1;
+        let path = loop {
+            let candidate = dir.join(crate::naming::numbered(filename, n));
+            if !taken(&shared, &candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        shared.reserved.insert(path.clone());
+        path
+    }
+
+    /// Devuelve un destino reservado que al final no se usó.
+    pub fn release_path(&self, path: &Path) {
+        self.lock().reserved.remove(path);
     }
 
     /// Añade una descarga en curso y devuelve su control.
@@ -103,26 +167,42 @@ impl Registry {
             headers,
             merge: None,
         };
-        self.lock().push(entry);
+        let mut shared = self.lock();
+        shared.reserved.remove(&entry.record.path);
+        shared.entries.push(entry);
         control
     }
 
     /// Modifica el registro de una descarga. Devuelve `None` si no existe.
     pub fn update<T>(&self, id: &str, f: impl FnOnce(&mut Entry) -> T) -> Option<T> {
-        let mut entries = self.lock();
-        entries.iter_mut().find(|e| e.record.id == id).map(f)
+        let mut shared = self.lock();
+        shared.entries.iter_mut().find(|e| e.record.id == id).map(f)
     }
 
     pub fn get(&self, id: &str) -> Option<Entry> {
-        self.lock().iter().find(|e| e.record.id == id).cloned()
+        self.lock()
+            .entries
+            .iter()
+            .find(|e| e.record.id == id)
+            .cloned()
     }
 
     pub fn records(&self) -> Vec<Record> {
-        self.lock().iter().map(|e| e.record.clone()).collect()
+        self.lock()
+            .entries
+            .iter()
+            .map(|e| e.record.clone())
+            .collect()
     }
 
     /// Guarda la cola en disco de forma atómica (archivo temporal y renombrado).
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        // El candado cubre captura, escritura y renombrado: la instantánea más reciente es la última.
+        let _saving = self
+            .0
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let json = serde_json::to_vec_pretty(&self.records()).map_err(std::io::Error::other)?;
         let target = dir.join(QUEUE_FILE);
         let tmp = dir.join(format!("{QUEUE_FILE}.tmp"));
@@ -130,8 +210,9 @@ impl Registry {
         std::fs::rename(&tmp, &target)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
         self.0
+            .shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -185,6 +266,33 @@ mod tests {
         assert!(State::Interrupted.is_resumable());
         assert!(!State::Running.is_resumable());
         assert!(!State::Done.is_resumable());
+    }
+
+    #[test]
+    fn guardados_simultaneos_no_se_pisan() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::default();
+        for i in 0..20 {
+            reg.insert(record(&format!("id{i}"), State::Running), HeaderMap::new());
+        }
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (reg, path) = (reg.clone(), dir.path().to_path_buf());
+                std::thread::spawn(move || {
+                    (0..60)
+                        .map(|_| reg.save(&path))
+                        .filter(|r| r.is_err())
+                        .count()
+                })
+            })
+            .collect();
+        let failures: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(failures, 0, "guardados fallidos por pisarse");
+        let text = std::fs::read_to_string(dir.path().join(QUEUE_FILE)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<Record>>(&text).unwrap().len(),
+            20
+        );
     }
 
     #[test]

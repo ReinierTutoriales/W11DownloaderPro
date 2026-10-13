@@ -43,6 +43,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Nombre con numeración: `n == 1` es el original; después ` (2)`, ` (3)`… antes de la extensión.
+pub fn numbered(name: &str, n: u32) -> String {
+    if n <= 1 {
+        return name.to_owned();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// `ruta` con `suffix` añadido al nombre completo (`a.zip` + `.part`).
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// Ruta libre en `dir`: si `name` ya existe, añade ` (2)`, ` (3)`… antes de la extensión.
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);

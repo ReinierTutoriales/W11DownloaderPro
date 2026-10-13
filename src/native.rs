@@ -197,7 +197,14 @@ where
                 filename,
                 headers,
                 queued,
-            }) => match prepare(&id, &url, filename.as_deref(), &headers, &out_dir) {
+            }) => match prepare(
+                &id,
+                &url,
+                filename.as_deref(),
+                &headers,
+                &out_dir,
+                &registry,
+            ) {
                 Ok(mut job) => {
                     let _ = tx.send(Outgoing::Accepted {
                         id: id.clone(),
@@ -357,6 +364,7 @@ fn prepare(
     filename: Option<&str>,
     headers: &HashMap<String, String>,
     out_dir: &std::path::Path,
+    registry: &Registry,
 ) -> Result<Job, String> {
     let parsed = Url::parse(url).map_err(|_| format!("URL no válida: {url}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -377,7 +385,7 @@ fn prepare(
         .and_then(naming::sanitize)
         .unwrap_or_else(|| naming::file_name(&parsed));
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
-    let output = naming::unique_path(out_dir, &name);
+    let output = registry.claim_path(out_dir, &name, &[]);
 
     Ok(Job {
         id: id.to_owned(),
@@ -419,12 +427,15 @@ async fn run_video(
             return;
         }
     };
-    let output = if choice.via_ytdlp {
-        unique_media_path(&out_dir, &choice.filename)
+    // El contenedor de un vídeo delegado lo decide yt-dlp: se reservan todas las extensiones posibles.
+    let alternatives: &[&str] = if choice.via_ytdlp {
+        &["mp4", "mkv", "webm", "mov"]
     } else {
-        naming::unique_path(&out_dir, &choice.filename)
+        &[]
     };
+    let output = registry.claim_path(&out_dir, &choice.filename, alternatives);
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        registry.release_path(&output);
         let _ = tx.send(Outgoing::Error {
             id,
             message: e.to_string(),
@@ -751,31 +762,6 @@ fn failed(registry: &Registry, id: &str, message: &str) -> Outgoing {
     }
 }
 
-/// Ruta libre para un vídeo cuyo contenedor decide yt-dlp: ninguna de las extensiones posibles
-/// puede existir ya con ese nombre, o se tomaría un archivo ajeno por el recién descargado.
-fn unique_media_path(dir: &Path, filename: &str) -> PathBuf {
-    let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "video".into());
-    let ext = path
-        .extension()
-        .map_or("mp4".into(), |e| e.to_string_lossy().into_owned());
-    let taken = |name: &str| {
-        ["mp4", "mkv", "webm", "mov"]
-            .iter()
-            .any(|e| dir.join(format!("{name}.{e}")).exists())
-    };
-    let mut name = stem.clone();
-    let mut n = 0;
-    while taken(&name) {
-        n += 1;
-        name = format!("{stem} ({n})");
-    }
-    dir.join(format!("{name}.{ext}"))
-}
-
 /// Borra el parcial y su estado de reanudación de una descarga cancelada.
 async fn remove_partials(output: &Path) {
     let part = naming_with_suffix(output, ".part");
@@ -785,9 +771,7 @@ async fn remove_partials(output: &Path) {
 }
 
 fn naming_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
+    naming::with_suffix(path, suffix)
 }
 
 #[cfg(test)]
@@ -815,15 +799,30 @@ mod tests {
     fn cabecera_no_permitida_se_rechaza() {
         let dir = tempfile::tempdir().unwrap();
         let headers = HashMap::from([("X-Evil".to_owned(), "1".to_owned())]);
-        let err = prepare("1", "https://x.test/a.zip", None, &headers, dir.path()).unwrap_err();
+        let err = prepare(
+            "1",
+            "https://x.test/a.zip",
+            None,
+            &headers,
+            dir.path(),
+            &Registry::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("no permitida"), "{err}");
     }
 
     #[test]
     fn esquema_no_web_se_rechaza() {
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            prepare("1", "file:///etc/passwd", None, &HashMap::new(), dir.path()).unwrap_err();
+        let err = prepare(
+            "1",
+            "file:///etc/passwd",
+            None,
+            &HashMap::new(),
+            dir.path(),
+            &Registry::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("esquema"), "{err}");
     }
 
@@ -836,6 +835,7 @@ mod tests {
             Some("..\\..\\evil.exe"),
             &HashMap::new(),
             dir.path(),
+            &Registry::default(),
         )
         .unwrap();
         assert_eq!(job.output.parent().unwrap(), dir.path());
