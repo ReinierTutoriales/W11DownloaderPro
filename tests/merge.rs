@@ -144,18 +144,27 @@ async fn cancelar_no_deja_archivos_y_un_fallo_de_union_conserva_las_pistas() {
         dir.path().join("malo.mp4.video").exists() && dir.path().join("malo.mp4.audio").exists()
     );
 
-    // Con las pistas buenas ya en disco, reintentar no vuelve a pedirlas al servidor.
-    std::fs::write(dir.path().join("malo.mp4.video"), v).unwrap();
-    let (addr2, site2) = serve(vec![
-        ("/v.mp4", "video/mp4", vec![]),
-        ("/a.m4a", "audio/mp4", vec![]),
+    assert!(
+        dir.path().join("malo.mp4.video.done").exists()
+            && dir.path().join("malo.mp4.audio.done").exists(),
+        "las pistas completas quedan certificadas por un manifiesto"
+    );
+
+    // Reintento contra un recurso cuyo vídeo cambió: la pista de sonido sigue siendo la misma
+    // (mismo tamaño y validador) y se reutiliza; la de imagen ya no coincide y se vuelve a bajar.
+    let (addr2, _site2) = serve(vec![
+        ("/v.mp4", "video/mp4", v.clone()),
+        ("/a.m4a", "audio/mp4", a.clone()),
     ])
     .await;
     let outcome = download_merged(Options::new("x", &out), job(addr2), Control::default())
         .await
         .unwrap();
-    assert!(matches!(outcome, Outcome::Completed(_)));
-    assert_eq!(site2.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let Outcome::Completed(report) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(report.downloaded, v.len() as u64, "{report:?}");
+    assert_eq!(report.resumed, a.len() as u64, "{report:?}");
     assert_eq!(streams(&out), "video,audio");
 
     // Cancelación previa: nada queda en disco.

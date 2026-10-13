@@ -154,6 +154,11 @@ impl Control {
         }
     }
 
+    /// Se pidió pausar o cancelar.
+    pub fn is_interrupted(&self) -> bool {
+        self.state() != RUN
+    }
+
     pub fn is_canceled(&self) -> bool {
         self.0.load(Ordering::SeqCst) == CANCEL
     }
@@ -191,16 +196,51 @@ pub async fn download_controlled(opts: Options, control: Control) -> Result<Outc
     };
     // Dueño exclusivo del destino durante TODO el ciclo: comprobar el estado, transferir, verificar,
     // publicar y limpiar. Quien llegue después recibe `Busy` sin tocar ningún archivo.
-    let lock = Arc::new(open_locked(&paths.part).await?);
+    let _guard = acquire_guard(&opts.output).await?;
+    let lock = Arc::new(open_part(&paths.part).await?);
     let result = run_locked(&opts, &control, &paths, &lock).await;
     if !matches!(result, Ok(Outcome::Completed(_))) {
-        // Una descarga que no llegó a escribir nada no deja un parcial vacío suelto.
+        // Una descarga que no llegó a escribir nada no deja un parcial vacío suelto (con la exclusión
+        // todavía tomada: nadie puede abrir el parcial entre medias).
         let empty = lock.metadata().map(|m| m.len() == 0).unwrap_or(false);
         if empty && !paths.state.exists() {
             let _ = tokio::fs::remove_file(&paths.part).await;
         }
     }
     result
+}
+
+/// Identidad comprobable de un recurso remoto: su tamaño y un validador fuerte (`ETag` fuerte o
+/// `Last-Modified` fuerte). Un enlace distinto no demuestra por sí solo que el contenido cambiara, ni
+/// el mismo enlace que no haya cambiado.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Identity {
+    pub total: u64,
+    pub validator: String,
+}
+
+/// Consulta el recurso y devuelve su identidad, o `None` si no se puede comprobar (sin tamaño o sin
+/// validador fuerte).
+pub async fn identify(opts: &Options) -> Result<Option<Identity>> {
+    let client = net::build_client(1, &opts.proxy)?;
+    let remote = net::probe(&client, &opts.url, &opts.headers, opts.idle_timeout).await?;
+    let validators = Validators::new(
+        remote.etag.clone(),
+        remote.last_modified.clone(),
+        remote.date.as_deref(),
+    );
+    let validator = match validators.etag.as_deref() {
+        Some(tag) if !tag.starts_with("W/") => Some(format!("etag:{tag}")),
+        _ if validators.lm_strong => validators
+            .last_modified
+            .as_deref()
+            .map(|lm| format!("lm:{lm}")),
+        _ => None,
+    };
+    Ok(match (remote.total, validator) {
+        (Some(total), Some(validator)) => Some(Identity { total, validator }),
+        _ => None,
+    })
 }
 
 /// Borra el parcial y el estado de un destino que no se está descargando. Toma antes el bloqueo del
@@ -210,46 +250,29 @@ pub async fn discard_partials(output: &Path) -> Result<()> {
         part: with_suffix(output, ".part"),
         state: with_suffix(output, ".part.state"),
     };
-    let lock = open_locked(&paths.part).await?;
+    // La exclusión se mantiene hasta terminar de borrar: nadie abre el parcial a medias.
+    let _guard = acquire_guard(output).await?;
     // Ausente no es un fallo; cualquier otro error (permisos, archivo en uso) se comunica.
     let state = remove_if_exists(&paths.state).await;
-    drop(lock);
     let part = remove_if_exists(&paths.part).await;
     state?;
     part?;
     Ok(())
 }
 
-/// Exclusión del destino final de un trabajo compuesto (varias pistas, unión): toma el mismo bloqueo
+/// Exclusión del destino final de un trabajo compuesto (varias pistas, unión): toma la misma exclusión
 /// que una descarga directa sobre ese destino, así que ambas se excluyen mutuamente. Mientras se
 /// mantiene, nadie más toca el destino, sus intermedios ni su temporal de unión.
 pub struct DestinationLock {
-    file: Option<File>,
-    part: PathBuf,
+    _guard: File,
 }
 
 impl DestinationLock {
     /// `Error::Busy` si otra descarga o trabajo tiene el destino.
     pub async fn acquire(output: &Path) -> Result<Self> {
-        let part = with_suffix(output, ".part");
-        let file = open_locked(&part).await?;
         Ok(Self {
-            file: Some(file),
-            part,
+            _guard: acquire_guard(output).await?,
         })
-    }
-}
-
-impl Drop for DestinationLock {
-    fn drop(&mut self) {
-        // Suelta el bloqueo y no deja el marcador vacío (en Windows no se puede borrar abierto).
-        if let Some(file) = self.file.take() {
-            let empty = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
-            drop(file);
-            if empty {
-                let _ = std::fs::remove_file(&self.part);
-            }
-        }
     }
 }
 
@@ -309,8 +332,7 @@ async fn run_locked(
 
     let (part, state_path) = (&paths.part, &paths.state);
     if let Some(expected) = &opts.sha256 {
-        // Se lee por el mismo manejador que tiene el bloqueo: en Windows el bloqueo es obligatorio y
-        // cualquier otro manejador no podría leer el parcial mientras lo conservamos.
+        // Se lee por el mismo manejador que escribió el parcial.
         let actual = sha256_of(lock).await?;
         if !actual.eq_ignore_ascii_case(expected) {
             let _ = tokio::fs::remove_file(part).await;
@@ -361,7 +383,7 @@ struct Session<'a> {
     headers: &'a HeaderMap,
     control: &'a Control,
     paths: &'a Paths,
-    /// Manejador del parcial que tiene el bloqueo exclusivo.
+    /// Manejador del parcial, con la exclusión del destino ya tomada.
     lock: &'a Arc<File>,
 }
 
@@ -975,15 +997,17 @@ async fn abandon_single(
     part: &Path,
     control: &Control,
     written: u64,
-) -> Step {
+) -> Result<Step> {
     drop(file);
-    let _ = tokio::fs::remove_file(part).await;
+    // Con la exclusión del destino tomada. Un fallo al borrar se comunica: no se confirma la
+    // interrupción de algo que dejó restos.
+    remove_if_exists(part).await?;
     let bytes = if control.state() == CANCEL {
         0
     } else {
         written
     };
-    Step::Interrupted { bytes }
+    Ok(Step::Interrupted { bytes })
 }
 
 async fn single(session: &Session<'_>) -> Result<Step> {
@@ -1023,7 +1047,7 @@ async fn single(session: &Session<'_>) -> Result<Step> {
                     opts.idle_timeout.as_secs_f32()
                 )));
             }
-            None => return Ok(abandon_single(file, part, control, written).await),
+            None => return abandon_single(file, part, control, written).await,
         };
         let frame = frame?;
         if let Ok(data) = frame.into_data() {
@@ -1032,7 +1056,7 @@ async fn single(session: &Session<'_>) -> Result<Step> {
                 tokio::select! {
                     () = limiter.throttle(data.len() as u64) => {}
                     () = control.interrupted() => {
-                        return Ok(abandon_single(file, part, control, written).await);
+                        return abandon_single(file, part, control, written).await;
                     }
                 }
             }
@@ -1062,21 +1086,54 @@ async fn single(session: &Session<'_>) -> Result<Step> {
     }))
 }
 
-/// Abre el parcial con bloqueo exclusivo del sistema, que se mantiene mientras viva el manejador (y
-/// desaparece solo si el proceso muere). Dos descargas a la misma ruta no pueden escribir a la vez: la
-/// segunda recibe `Error::Busy` sin tocar el archivo. No se trunca ni se redimensiona aquí: eso solo
-/// se hace con el bloqueo tomado y después de validar el estado.
-async fn open_locked(part: &Path) -> Result<File> {
-    let part = part.to_path_buf();
+/// Carpeta, junto al destino, con los archivos de exclusión.
+const LOCK_DIR: &str = ".w11dl-locks";
+
+/// Archivo de exclusión de un destino: estable (nunca se renombra ni se borra) y vacío. Se mantiene
+/// tomado durante toda la descarga —estado, transferencia, verificación, publicación y limpieza—, así
+/// que renombrar o borrar el parcial no abre ninguna ventana entre soltar el bloqueo y limpiar.
+fn lock_path(output: &Path) -> PathBuf {
+    let dir = output.parent().unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "destino".into());
+    dir.join(LOCK_DIR).join(format!("{name}.lock"))
+}
+
+/// Toma la exclusión del destino con el bloqueo del sistema, que se mantiene mientras viva el
+/// manejador (y desaparece solo si el proceso muere). La segunda descarga a la misma ruta recibe
+/// `Error::Busy` sin tocar ningún archivo.
+async fn acquire_guard(output: &Path) -> Result<File> {
+    let path = lock_path(output);
     tokio::task::spawn_blocking(move || {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&part)?;
-        lock_exclusive(&file, &part)?;
+            .open(&path)?;
+        lock_exclusive(&file, &path)?;
         Ok(file)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Abre (o crea) el parcial sin truncarlo ni redimensionarlo: eso solo se hace con la exclusión
+/// tomada y después de validar el estado.
+async fn open_part(part: &Path) -> Result<File> {
+    let part = part.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&part)?)
     })
     .await
     .map_err(io::Error::other)?

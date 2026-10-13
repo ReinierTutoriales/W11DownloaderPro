@@ -72,8 +72,12 @@ struct Running {
 }
 
 async fn start_hanging_merge(dir: &Path, output: &Path) -> Running {
+    start_hanging_merge_with(dir, output, payload(200_000)).await
+}
+
+async fn start_hanging_merge_with(dir: &Path, output: &Path, video: Vec<u8>) -> Running {
     let (addr, _site) = serve(vec![
-        ("/v.mp4", "video/mp4", payload(200_000)),
+        ("/v.mp4", "video/mp4", video),
         ("/a.m4a", "audio/mp4", payload(50_000)),
     ])
     .await;
@@ -187,6 +191,7 @@ async fn cancelar_una_union_pausada_borra_pistas_parciales_y_temporal() {
     let left: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
+        .filter(|n| n != ".w11dl-locks")
         .collect();
     assert!(left.is_empty(), "quedaron restos: {left:?}");
 }
@@ -286,4 +291,137 @@ async fn reanudar_un_video_con_pistas_tras_reiniciar_nunca_baja_solo_la_imagen()
         matches!(records[0].state, State::Failed { .. }) && records[0].merged,
         "{records:?}"
     );
+}
+
+#[tokio::test]
+async fn una_pista_completa_sin_manifiesto_o_con_otro_tamano_no_se_reutiliza() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("final.mp4");
+    let video = payload(200_000);
+    // Una pista terminada de quién sabe qué selección, sin manifiesto: no se puede comprobar.
+    std::fs::write(dir.path().join("final.mp4.video"), b"otra cosa").unwrap();
+    // Otra con manifiesto de un recurso de distinto tamaño.
+    std::fs::write(dir.path().join("final.mp4.audio"), vec![1u8; 50_000]).unwrap();
+    std::fs::write(
+        dir.path().join("final.mp4.audio.done"),
+        br#"{"total":49999,"validator":"etag:\"v1\""}"#,
+    )
+    .unwrap();
+
+    let running = start_hanging_merge_with(dir.path(), &out, video.clone()).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("final.mp4.video")).unwrap(),
+        video,
+        "la pista sin manifiesto debía descargarse de nuevo"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("final.mp4.audio")).unwrap(),
+        payload(50_000),
+        "la pista con manifiesto de otro tamaño debía descargarse de nuevo"
+    );
+    assert!(dir.path().join("final.mp4.video.done").exists());
+    running.control.cancel();
+    let _ = running.handle.await;
+}
+
+/// ffmpeg falso que termina bien: escribe el temporal (su último argumento) y sale.
+fn quick_ffmpeg(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("ffmpeg-rapido.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nfor a; do last=\"$a\"; done\necho unido > \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+    #[cfg(windows)]
+    {
+        let script = dir.join("ffmpeg-rapido.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\nfor %%a in (%*) do set last=%%a\r\necho unido> %last%\r\n",
+        )
+        .unwrap();
+        script
+    }
+}
+
+#[tokio::test]
+async fn una_pausa_que_llega_al_terminar_la_union_no_publica() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("final.mp4");
+    let (addr, _site) = serve(vec![
+        ("/v.mp4", "video/mp4", payload(100_000)),
+        ("/a.m4a", "audio/mp4", payload(50_000)),
+    ])
+    .await;
+    let gate = std::sync::Arc::new(w11dl::engine::Gate::default());
+    let mut opts = Options::new("ignorada", &out);
+    opts.gate = Some(std::sync::Arc::clone(&gate));
+    let control = Control::default();
+    let handle = tokio::spawn(download_merged(
+        opts,
+        job(addr, quick_ffmpeg(dir.path())),
+        control.clone(),
+    ));
+    // ffmpeg ya terminó y el temporal existe; la pausa llega justo antes de publicar.
+    tokio::time::timeout(Duration::from_secs(30), gate.reached.acquire())
+        .await
+        .expect("no se llegó a la barrera")
+        .unwrap()
+        .forget();
+    assert!(dir.path().join("final.mp4.merging").exists());
+    control.pause();
+    gate.release.add_permits(1);
+
+    let outcome = handle.await.unwrap().unwrap();
+    assert!(matches!(outcome, Outcome::Paused { .. }), "{outcome:?}");
+    assert!(!out.exists(), "una pausa no puede acabar publicando");
+    assert!(!dir.path().join("final.mp4.merging").exists());
+    assert!(dir.path().join("final.mp4.video").exists());
+    assert!(dir.path().join("final.mp4.audio").exists());
+}
+
+#[tokio::test]
+async fn el_archivo_de_exclusion_es_estable_y_borrar_parciales_no_pisa_una_descarga_nueva() {
+    let data = payload(300_000);
+    let (addr, _site) = serve(vec![("/f.bin", "application/octet-stream", data.clone())]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("f.bin");
+
+    let url = format!("http://{addr}/f.bin");
+    let cleaner = {
+        let out = out.clone();
+        tokio::spawn(async move {
+            let mut cleaned = 0;
+            for _ in 0..200 {
+                if w11dl::engine::discard_partials(&out).await.is_ok() {
+                    cleaned += 1;
+                }
+                tokio::task::yield_now().await;
+            }
+            cleaned
+        })
+    };
+    let mut done = 0;
+    for round in 0..40 {
+        let _ = std::fs::remove_file(&out);
+        match download(Options::new(url.clone(), &out)).await {
+            Ok(_) => {
+                assert!(std::fs::read(&out).unwrap() == data, "ronda {round}");
+                done += 1;
+            }
+            Err(Error::Busy(_)) => {}
+            Err(e) => panic!("ronda {round}: {e}"),
+        }
+    }
+    let _ = cleaner.await.unwrap();
+    assert!(done > 0, "ninguna descarga llegó a completarse");
+    let lock = dir.path().join(".w11dl-locks").join("f.bin.lock");
+    assert!(lock.exists(), "el archivo de exclusión es persistente");
+    assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0);
 }

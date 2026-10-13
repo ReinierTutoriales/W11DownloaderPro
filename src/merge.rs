@@ -102,6 +102,10 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
         o.headers = track.headers.clone();
         o.output = file.to_path_buf();
         o.sha256 = None;
+        #[cfg(feature = "test-hooks")]
+        {
+            o.gate = None;
+        }
         o.progress = Some(Arc::clone(&progress));
         o
     };
@@ -128,16 +132,7 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
             let tmp = with_suffix(&output, ".merging");
             match run_ffmpeg(&job, &video_file, &audio_file, &tmp, &output, &control).await? {
                 Joined::Interrupted => {
-                    // Sin publicar nada: pausar conserva las pistas; cancelar lo borra todo.
-                    engine::remove_if_exists(&tmp).await?;
-                    return if control.is_canceled() {
-                        discard_tracks(&output).await?;
-                        Ok(Outcome::Canceled)
-                    } else {
-                        Ok(Outcome::Paused {
-                            bytes: rv.bytes + ra.bytes,
-                        })
-                    };
+                    return stop(&control, &output, &tmp, rv.bytes + ra.bytes).await;
                 }
                 Joined::Failed(message) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
@@ -146,16 +141,22 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
                 }
                 Joined::Done => {}
             }
-            // Una orden que llegó justo al terminar la unión también se respeta antes de publicar.
-            if control.is_canceled() {
-                engine::remove_if_exists(&tmp).await?;
-                discard_tracks(&output).await?;
-                return Ok(Outcome::Canceled);
+            #[cfg(feature = "test-hooks")]
+            if let Some(gate) = &base.gate {
+                gate.reached.add_permits(1);
+                if let Ok(permit) = gate.release.acquire().await {
+                    permit.forget();
+                }
+            }
+            // Una pausa o cancelación que llegó justo al terminar la unión también se respeta antes de publicar.
+            if control.is_interrupted() {
+                return stop(&control, &output, &tmp, rv.bytes + ra.bytes).await;
             }
             tokio::fs::rename(&tmp, &output).await?;
             let bytes = tokio::fs::metadata(&output).await?.len();
             for file in [&video_file, &audio_file] {
                 let _ = tokio::fs::remove_file(file).await;
+                let _ = tokio::fs::remove_file(manifest_of(file)).await;
             }
             progress.store(bytes, Ordering::Relaxed);
             Ok(Outcome::Completed(Report {
@@ -166,6 +167,18 @@ async fn merge_locked(base: Options, job: MergeJob, control: Control) -> Result<
                 mode: rv.mode,
             }))
         }
+    }
+}
+
+/// Fin anticipado por pausa o cancelación, sin publicar nada: el temporal se retira siempre; pausar
+/// conserva las pistas y cancelar las borra.
+async fn stop(control: &Control, output: &Path, tmp: &Path, bytes: u64) -> Result<Outcome> {
+    engine::remove_if_exists(tmp).await?;
+    if control.is_canceled() {
+        discard_tracks(output).await?;
+        Ok(Outcome::Canceled)
+    } else {
+        Ok(Outcome::Paused { bytes })
     }
 }
 
@@ -223,21 +236,60 @@ async fn run_ffmpeg(
     )))
 }
 
-/// Descarga una pista; si ya está completa de una ejecución anterior, no la repite.
+/// Manifiesto de una pista completa: la identidad del recurso del que salió.
+fn manifest_of(track: &Path) -> PathBuf {
+    with_suffix(track, ".done")
+}
+
+async fn write_manifest(track: &Path, identity: &engine::Identity) -> Result<()> {
+    let target = manifest_of(track);
+    let tmp = with_suffix(&target, ".tmp");
+    let json = serde_json::to_vec(identity).map_err(std::io::Error::other)?;
+    tokio::fs::write(&tmp, json).await?;
+    tokio::fs::rename(&tmp, &target).await?;
+    Ok(())
+}
+
+async fn read_manifest(track: &Path) -> Option<engine::Identity> {
+    let text = tokio::fs::read(manifest_of(track)).await.ok()?;
+    serde_json::from_slice(&text).ok()
+}
+
+/// Descarga una pista. Una pista completa de una ejecución anterior solo se reutiliza si su
+/// manifiesto coincide con la identidad actual del recurso (mismo tamaño y mismo validador fuerte); si
+/// no puede comprobarse, se vuelve a descargar. Reutilizarla a ciegas podría unir pistas de
+/// selecciones o contenidos distintos.
 async fn fetch_track(opts: Options, control: Control) -> Result<Outcome> {
     if let Ok(meta) = tokio::fs::metadata(&opts.output).await {
-        if let Some(p) = &opts.progress {
-            p.fetch_add(meta.len(), Ordering::Relaxed);
+        let saved = read_manifest(&opts.output).await;
+        let now = engine::identify(&opts).await.ok().flatten();
+        let reusable =
+            matches!((&saved, &now), (Some(a), Some(b)) if a == b && a.total == meta.len());
+        if reusable {
+            if let Some(p) = &opts.progress {
+                p.fetch_add(meta.len(), Ordering::Relaxed);
+            }
+            return Ok(Outcome::Completed(Report {
+                bytes: meta.len(),
+                downloaded: 0,
+                resumed: meta.len(),
+                elapsed: std::time::Duration::ZERO,
+                mode: engine::Mode::Single,
+            }));
         }
-        return Ok(Outcome::Completed(Report {
-            bytes: meta.len(),
-            downloaded: 0,
-            resumed: meta.len(),
-            elapsed: std::time::Duration::ZERO,
-            mode: engine::Mode::Single,
-        }));
+        engine::remove_if_exists(&opts.output).await?;
     }
-    engine::download_controlled(opts, control).await
+    engine::remove_if_exists(&manifest_of(&opts.output)).await?;
+
+    let before = engine::identify(&opts).await.ok().flatten();
+    let outcome = engine::download_controlled(opts.clone(), control).await?;
+    if let (Outcome::Completed(_), Some(before)) = (&outcome, before) {
+        // Solo se certifica si el recurso sigue siendo el mismo después de bajarlo.
+        if engine::identify(&opts).await.ok().flatten().as_ref() == Some(&before) {
+            write_manifest(&opts.output, &before).await?;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Borra las pistas, sus parciales y el temporal de unión de un destino. Ausente no es un fallo; el
@@ -250,9 +302,11 @@ async fn discard_tracks(output: &Path) -> Result<()> {
         video.clone(),
         with_suffix(&video, ".part"),
         with_suffix(&video, ".part.state"),
+        manifest_of(&video),
         audio.clone(),
         with_suffix(&audio, ".part"),
         with_suffix(&audio, ".part.state"),
+        manifest_of(&audio),
         with_suffix(output, ".merging"),
     ];
     for file in files {
