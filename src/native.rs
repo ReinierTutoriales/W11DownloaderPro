@@ -162,7 +162,9 @@ where
     let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let limiter = RateLimiter::new(settings::load_limit(&out_dir));
     let mut jobs = tokio::task::JoinSet::new();
-    let registry = Registry::load(&out_dir);
+    // Propietario de la cola mientras dure la sesión; si otro proceso lo es, esta sesión funciona pero
+    // no la guarda (y el primer intento de guardar avisa a la extensión una sola vez).
+    let (registry, _queue_owner) = Registry::open(&out_dir);
     persist(&registry, &out_dir, &tx);
 
     while let Some(raw) = read_message(&mut input).await? {
@@ -591,8 +593,17 @@ async fn run(
 
 /// Ejecuta sin navegador lo que esté en espera (`Queued`) o interrumpido, y resume el resultado.
 /// Lo usa la tarea programada: no hay proceso residente, solo esta ejecución puntual.
-pub async fn run_pending(out_dir: PathBuf) -> crate::schedule::Summary {
-    let registry = Registry::load(&out_dir);
+///
+/// Falla con `Error::Busy` si otro proceso (p. ej. el host del navegador) ya gestiona la cola de la
+/// carpeta: dos procesos no pueden escribirla a la vez, y la cola programada debe reintentarse más tarde.
+pub async fn run_pending(out_dir: PathBuf) -> crate::error::Result<crate::schedule::Summary> {
+    let (registry, owner) = Registry::open(&out_dir);
+    let Some(_queue_owner) = owner else {
+        return Err(crate::error::Error::Busy(format!(
+            "otra instancia de W11DownloaderPro gestiona la cola de {}",
+            out_dir.display()
+        )));
+    };
     let limiter = RateLimiter::new(settings::load_limit(&out_dir));
     let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
     // Nadie escucha los eventos: se vacían para que el canal no crezca.
@@ -644,7 +655,7 @@ pub async fn run_pending(out_dir: PathBuf) -> crate::schedule::Summary {
             _ => summary.canceled += 1,
         }
     }
-    summary
+    Ok(summary)
 }
 
 /// Ajustes persistentes del host (solo el límite de velocidad; nada de sesión).

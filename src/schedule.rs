@@ -147,6 +147,10 @@ pub fn task_xml(when: &str, host_exe: &Path, out_dir: &Path, after: After) -> St
     <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
     <WakeToRun>true</WakeToRun>
+    <RestartOnFailure>
+      <Interval>PT10M</Interval>
+      <Count>12</Count>
+    </RestartOnFailure>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
@@ -247,6 +251,8 @@ mod tests {
         assert!(xml.contains("--after shutdown"));
         assert!(xml.contains("<WakeToRun>true</WakeToRun>"));
         assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+        // Si la cola está en uso por el host del navegador, `run-queue` sale con error y se reintenta.
+        assert!(xml.contains("<RestartOnFailure>") && xml.contains("<Count>12</Count>"));
         assert!(!xml.contains("Ana & Co"), "sin escapar rompería el XML");
     }
 }

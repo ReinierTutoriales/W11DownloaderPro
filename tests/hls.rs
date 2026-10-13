@@ -272,7 +272,9 @@ async fn el_host_descarga_un_hls_con_ytdlp_y_deja_el_archivo_real() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(".w11dl-") && n != ".w11dl-queue.json")
+        .filter(|n| {
+            n.starts_with(".w11dl-") && n != ".w11dl-queue.json" && n != ".w11dl-queue.lock"
+        })
         .collect();
     assert!(leftovers.is_empty(), "restos de intermedios: {leftovers:?}");
 }

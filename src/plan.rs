@@ -312,28 +312,48 @@ pub fn hedge_worthwhile(len: u64, received: u64, age_ms: u64, typical_rate: f64)
 }
 
 /// Segundos desde 1970 de una fecha HTTP en formato IMF (`Sun, 06 Nov 1994 08:49:37 GMT`), el único
-/// que los servidores deben enviar hoy. Cualquier otra forma se trata como desconocida.
+/// que los servidores deben enviar hoy. La gramática es estricta: campos de ancho fijo y solo dígitos,
+/// mes y día de la semana en inglés, día que exista en ese mes (con años bisiestos), día de la semana
+/// que corresponda a la fecha, hora 00-23, minutos y segundos 00-59 y zona `GMT`. Cualquier otra forma
+/// (RFC 850, asctime, valores fuera de rango) se trata como desconocida.
 pub fn parse_http_date(text: &str) -> Option<i64> {
-    let text = text.trim();
-    let (_, rest) = text.split_once(", ")?;
-    let mut parts = rest.split_whitespace();
-    let day: i64 = parts.next()?.parse().ok()?;
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let name = parts.next()?;
-    let month = MONTHS.iter().position(|m| *m == name)? as i64 + 1;
-    let year: i64 = parts.next()?.parse().ok()?;
-    let mut clock = parts.next()?.split(':');
-    let (h, m, sec): (i64, i64, i64) = (
-        clock.next()?.parse().ok()?,
-        clock.next()?.parse().ok()?,
-        clock.next()?.parse().ok()?,
-    );
-    if parts.next()? != "GMT" || parts.next().is_some() || clock.next().is_some() {
+    let b = text.trim().as_bytes();
+    // "Www, DD Mmm YYYY HH:MM:SS GMT" -> 29 bytes con separadores en posiciones fijas.
+    if b.len() != 29
+        || &b[3..5] != b", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &b[25..] != b" GMT"
+    {
         return None;
     }
-    if !(1..=31).contains(&day) || h > 23 || m > 59 || sec > 60 || year < 1970 {
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = &b[range];
+        digits.iter().all(u8::is_ascii_digit).then(|| {
+            digits
+                .iter()
+                .fold(0i64, |n, d| n * 10 + i64::from(d - b'0'))
+        })
+    };
+    let weekday = DAYS.iter().position(|d| d.as_bytes() == &b[0..3])? as i64;
+    let day = num(5..7)?;
+    let month = MONTHS.iter().position(|m| m.as_bytes() == &b[8..11])? as i64 + 1;
+    let year = num(12..16)?;
+    let (h, m, sec) = (num(17..19)?, num(20..22)?, num(23..25)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => 28 + i64::from(leap),
+    };
+    if year < 1970 || !(1..=days_in_month).contains(&day) || h > 23 || m > 59 || sec > 59 {
         return None;
     }
     // Días desde 1970-01-01 (algoritmo de calendario civil de Howard Hinnant).
@@ -344,17 +364,29 @@ pub fn parse_http_date(text: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
+    // El 1 de enero de 1970 fue jueves (índice 3 con lunes = 0).
+    if (days + 3).rem_euclid(7) != weekday {
+        return None;
+    }
     Some(days * 86_400 + h * 3_600 + m * 60 + sec)
 }
+
+/// Separación mínima entre `Date` y `Last-Modified` para fiarse de este como validador fuerte.
+///
+/// La RFC 9110 §8.8.2.2 pide al menos un segundo, pero da por supuesto que ambas fechas salen del
+/// mismo reloj. Detrás de una CDN, `Date` lo pone el borde y `Last-Modified` el origen, con relojes
+/// distintos. Un minuto absorbe desajustes normales; si hay duda, no se fía (se pierde la reanudación
+/// sin SHA-256, nunca la integridad).
+pub const LM_STRONG_MARGIN_SECS: i64 = 60;
 
 /// Validadores del recurso remoto: lo que permite saber si sigue siendo el mismo archivo.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Validators {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-    /// `Last-Modified` solo es un validador fuerte si el recurso se modificó al menos un segundo
-    /// antes de la fecha de la respuesta (RFC 9110 §8.8.2.2): dos cambios dentro del mismo segundo
-    /// no se distinguirían. Sin `Date`, o con fechas ilegibles o futuras, no es fuerte.
+    /// `Last-Modified` solo es un validador fuerte si el recurso se modificó al menos
+    /// `LM_STRONG_MARGIN_SECS` antes de la fecha de la respuesta (RFC 9110 §8.8.2.2, con margen para
+    /// relojes distintos entre origen y CDN). Sin `Date`, o con fechas ilegibles o futuras, no es fuerte.
     pub lm_strong: bool,
 }
 
@@ -368,7 +400,7 @@ impl Validators {
             last_modified.as_deref().and_then(parse_http_date),
             response_date.and_then(parse_http_date),
         ) {
-            (Some(modified), Some(date)) => date - modified >= 1,
+            (Some(modified), Some(date)) => date - modified >= LM_STRONG_MARGIN_SECS,
             _ => false,
         };
         Self {
@@ -834,32 +866,61 @@ mod tests {
             parse_http_date("Thu, 29 Feb 2024 12:00:00 GMT"),
             Some(1_709_208_000)
         );
+        assert_eq!(
+            parse_http_date("  Thu, 01 Jan 1970 00:00:00 GMT  "),
+            Some(0),
+            "espacios sobrantes"
+        );
+    }
+
+    #[test]
+    fn fechas_http_invalidas_se_rechazan() {
         for bad in [
             "",
             "ayer",
-            "Sun Nov  6 08:49:37 1994",
-            "Sunday, 06-Nov-94 08:49:37 GMT",
-            "Sun, 06 Nov 1994 08:49:37 UTC",
-            "Sun, 32 Nov 1994 08:49:37 GMT",
-            "Sun, 06 Foo 1994 08:49:37 GMT",
-            "Sun, 06 Nov 1994 25:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",       // asctime
+            "Sunday, 06-Nov-94 08:49:37 GMT", // RFC 850
+            "Sun, 06 Nov 1994 08:49:37 UTC",  // zona
+            "Sun, 32 Nov 1994 08:49:37 GMT",  // día inexistente
+            "Wed, 31 Nov 1994 08:49:37 GMT",  // noviembre tiene 30 días
+            "Tue, 30 Feb 1994 08:49:37 GMT",  // febrero
+            "Fri, 29 Feb 2023 08:49:37 GMT",  // 2023 no es bisiesto
+            "Sun, 06 Foo 1994 08:49:37 GMT",  // mes
+            "Sun, 06 Nov 1994 25:49:37 GMT",  // hora
+            "Sun, 06 Nov 1994 08:60:37 GMT",  // minutos
+            "Sun, 06 Nov 1994 08:49:60 GMT",  // segundos (segundo intercalar)
+            "Sun, 06 Nov 1994 -8:49:37 GMT",  // signo
+            "Sun, 06 Nov 1994 +8:49:37 GMT",
+            "Sun, 6 Nov 1994 08:49:37 GMT",  // ancho variable
+            "Sun, 06 Nov 94 08:49:37 GMT",   // año de dos cifras
+            "Mon, 06 Nov 1994 08:49:37 GMT", // el día de la semana no corresponde
+            "Sun, 06 Nov 1969 08:49:37 GMT", // antes de 1970
+            "Sun, 06 Nov 1994 08:49:37 GMT extra",
         ] {
             assert_eq!(parse_http_date(bad), None, "{bad}");
         }
     }
 
     #[test]
-    fn last_modified_es_fuerte_solo_un_segundo_antes_de_la_fecha() {
+    fn last_modified_es_fuerte_solo_con_margen_suficiente_respecto_a_date() {
         let lm = "Sun, 06 Nov 1994 08:49:37 GMT";
         let with = |date: Option<&str>| Validators::new(None, Some(lm.into()), date);
         assert!(
-            with(Some("Sun, 06 Nov 1994 08:49:38 GMT")).lm_strong,
-            "un segundo antes basta"
+            with(Some("Sun, 06 Nov 1994 08:50:37 GMT")).lm_strong,
+            "60 s: fuerte"
         );
         assert!(with(Some("Mon, 07 Nov 1994 08:49:37 GMT")).lm_strong);
         assert!(
+            !with(Some("Sun, 06 Nov 1994 08:50:36 GMT")).lm_strong,
+            "59 s: aún débil"
+        );
+        assert!(
+            !with(Some("Sun, 06 Nov 1994 08:49:38 GMT")).lm_strong,
+            "1 s: la RFC lo admitiría, aquí no"
+        );
+        assert!(
             !with(Some("Sun, 06 Nov 1994 08:49:37 GMT")).lm_strong,
-            "mismo segundo: débil"
+            "mismo segundo"
         );
         assert!(
             !with(Some("Sun, 06 Nov 1994 08:49:36 GMT")).lm_strong,
@@ -867,6 +928,10 @@ mod tests {
         );
         assert!(!with(None).lm_strong, "sin Date no se puede saber");
         assert!(!with(Some("basura")).lm_strong);
+        assert!(
+            !with(Some("Sun, 31 Feb 1994 08:49:37 GMT")).lm_strong,
+            "Date inválido"
+        );
         assert!(
             !Validators::new(
                 None,

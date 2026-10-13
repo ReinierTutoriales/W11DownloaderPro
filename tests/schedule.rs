@@ -57,7 +57,7 @@ async fn lo_puesto_en_espera_no_empieza_y_la_cola_programada_lo_descarga() {
     assert_eq!(site.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(!dir.path().join("a.bin").exists());
 
-    let summary = run_pending(dir.path().to_path_buf()).await;
+    let summary = run_pending(dir.path().to_path_buf()).await.unwrap();
 
     assert_eq!((summary.done, summary.failed, summary.canceled), (2, 0, 0));
     assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), a);
@@ -88,7 +88,7 @@ async fn la_cola_programada_ignora_lo_pausado_y_lo_ya_terminado() {
     )
     .unwrap();
 
-    let summary = run_pending(dir.path().to_path_buf()).await;
+    let summary = run_pending(dir.path().to_path_buf()).await.unwrap();
 
     assert_eq!((summary.done, summary.failed, summary.canceled), (0, 0, 0));
     assert!(
@@ -115,7 +115,7 @@ async fn con_una_descarga_fallida_no_se_ejecuta_la_accion_final() {
     )
     .await;
 
-    let summary = run_pending(dir.path().to_path_buf()).await;
+    let summary = run_pending(dir.path().to_path_buf()).await.unwrap();
 
     assert_eq!((summary.done, summary.failed), (1, 1));
     assert!(!w11dl::schedule::should_run_after(&summary));

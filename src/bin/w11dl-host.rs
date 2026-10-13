@@ -65,7 +65,14 @@ async fn run_queue(args: &[String]) -> ExitCode {
         }
     };
     let out_dir = out_dir_from_args(args).unwrap_or_else(default_out_dir);
-    let summary = native::run_pending(out_dir).await;
+    let summary = match native::run_pending(out_dir).await {
+        Ok(summary) => summary,
+        Err(e) => {
+            // No es un fallo de las descargas: la cola está en uso. Sin acción final y con un código propio.
+            eprintln!("w11dl-host: {e}. Se reintentará cuando esa instancia se cierre.");
+            return ExitCode::from(2);
+        }
+    };
     println!(
         "Cola terminada: {} completadas, {} con error, {} sin terminar.",
         summary.done, summary.failed, summary.canceled

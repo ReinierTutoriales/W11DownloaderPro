@@ -14,6 +14,32 @@ use crate::engine::Control;
 
 /// Archivo de estado de la cola, junto a las descargas.
 pub const QUEUE_FILE: &str = ".w11dl-queue.json";
+/// Archivo de bloqueo que identifica al proceso propietario de la cola de una carpeta.
+pub const QUEUE_LOCK_FILE: &str = ".w11dl-queue.lock";
+
+/// Propiedad de la cola de una carpeta. Mientras viva este valor, ningún otro proceso (el host de otro
+/// navegador, la cola programada…) puede guardar la cola de esa carpeta; si el proceso muere, el
+/// sistema libera el bloqueo solo.
+#[derive(Debug)]
+pub struct QueueOwner(#[allow(dead_code)] std::fs::File);
+
+impl QueueOwner {
+    /// Intenta ser el propietario. `Ok(None)` significa que lo es otro proceso.
+    pub fn acquire(dir: &Path) -> std::io::Result<Option<Self>> {
+        std::fs::create_dir_all(dir)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(QUEUE_LOCK_FILE))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
 
 /// Estado de una descarga.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +105,8 @@ struct Inner {
     save_lock: Mutex<()>,
     /// El último guardado falló: evita repetir el mismo aviso en cada intento.
     save_failing: std::sync::atomic::AtomicBool,
+    /// Esta instancia no es la propietaria de la cola de la carpeta: puede trabajar, pero no la guarda.
+    read_only: bool,
 }
 
 #[derive(Default)]
@@ -89,8 +117,21 @@ struct Shared {
 }
 
 impl Registry {
-    /// Carga la cola guardada. Lo que estaba en curso queda como `Interrupted`; lo pausado sigue pausado.
+    /// Carga la cola de una carpeta y toma su propiedad. Sin ella (otro proceso la tiene) se devuelve
+    /// una vista de solo lectura que funciona pero no guarda: así nunca hay dos procesos escribiendo
+    /// el mismo archivo.
+    pub fn open(dir: &Path) -> (Self, Option<QueueOwner>) {
+        let owner = QueueOwner::acquire(dir).ok().flatten();
+        (Self::load_inner(dir, owner.is_none()), owner)
+    }
+
+    /// Carga la cola guardada sin tomar su propiedad. Lo que estaba en curso queda como `Interrupted`;
+    /// lo pausado sigue pausado.
     pub fn load(dir: &Path) -> Self {
+        Self::load_inner(dir, false)
+    }
+
+    fn load_inner(dir: &Path, read_only: bool) -> Self {
         let text = std::fs::read_to_string(dir.join(QUEUE_FILE)).unwrap_or_default();
         let records: Vec<Record> = serde_json::from_str(&text).unwrap_or_default();
         let entries = records
@@ -115,6 +156,7 @@ impl Registry {
             }),
             save_lock: Mutex::new(()),
             save_failing: std::sync::atomic::AtomicBool::new(false),
+            read_only,
         }))
     }
 
@@ -200,6 +242,11 @@ impl Registry {
 
     /// Guarda la cola en disco de forma atómica (archivo temporal y renombrado).
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        if self.0.read_only {
+            return Err(std::io::Error::other(
+                "otra instancia de W11DownloaderPro gestiona la cola de esta carpeta; esta sesión no la guarda",
+            ));
+        }
         // El candado cubre captura, escritura y renombrado: la instantánea más reciente es la última.
         let _saving = self
             .0
