@@ -541,3 +541,62 @@ async fn etag_debil_usa_last_modified_en_if_range_y_reanuda() {
     assert_eq!(server.chunk_requests.load(Ordering::SeqCst), chunks - half);
     assert_eq!(std::fs::read(dir.path().join("debil.bin")).unwrap(), data);
 }
+
+#[tokio::test]
+async fn parcial_truncado_con_estado_de_completados_no_se_reutiliza() {
+    let data = payload(2 * 1024 * 1024);
+    let (addr, server) = start(data.clone(), true, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let (opts, chunks, _) = interrupted(
+        dir.path(),
+        "truncado.bin",
+        &data,
+        &url,
+        Validators::new(Some(ETAG_VALUE.into()), None),
+    );
+    // El parcial perdió su final (disco lleno, copia a medias…) pero el estado sigue diciendo "hecho".
+    let part = dir.path().join("truncado.bin.part");
+    let file = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+    file.set_len(data.len() as u64 / 4).unwrap();
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(
+        report.resumed, 0,
+        "no debe fiarse de un parcial de otra longitud"
+    );
+    assert_eq!(
+        server.chunk_requests.load(Ordering::SeqCst),
+        chunks,
+        "baja todo de nuevo"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("truncado.bin")).unwrap(),
+        data
+    );
+}
+
+#[tokio::test]
+async fn parcial_mas_largo_de_lo_debido_tampoco_se_reutiliza() {
+    let data = payload(2 * 1024 * 1024);
+    let (addr, _server) = start(data.clone(), true, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("http://{addr}/file");
+    let (opts, _, _) = interrupted(
+        dir.path(),
+        "largo.bin",
+        &data,
+        &url,
+        Validators::new(Some(ETAG_VALUE.into()), None),
+    );
+    let part = dir.path().join("largo.bin.part");
+    let mut bytes = std::fs::read(&part).unwrap();
+    bytes.extend_from_slice(b"basura al final");
+    std::fs::write(&part, bytes).unwrap();
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(report.resumed, 0);
+    assert_eq!(std::fs::read(dir.path().join("largo.bin")).unwrap(), data);
+}

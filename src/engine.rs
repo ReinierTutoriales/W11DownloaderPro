@@ -232,6 +232,8 @@ async fn segmented(
     let chunk_size = plan::effective_chunk_size(total, opts.connections, opts.max_chunk);
 
     let validators = Validators::new(remote.etag.clone(), remote.last_modified.clone());
+    // El parcial se crea con la longitud final: si no la tiene, perdió datos que el estado da por buenos.
+    let part_len = tokio::fs::metadata(part).await.map(|m| m.len()).ok();
     let resumable = load_state(state_path)
         .await
         .filter(|s| {
@@ -240,7 +242,7 @@ async fn segmented(
                 // Un estado hecho con otro plan de fragmentos tendría índices que no corresponden.
                 && s.done.len() == plan::plan(total, chunk_size).len()
         })
-        .filter(|_| part.exists());
+        .filter(|_| part_len == Some(total));
 
     let fresh = resumable.is_none();
     let state =
