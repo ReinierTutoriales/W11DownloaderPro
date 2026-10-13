@@ -1,0 +1,83 @@
+W11DownloaderPro 0.0.2 — VERSIÓN DE PRUEBAS
+==========================================
+
+Esto es una versión de pruebas, no estable y sin firmar. Se ha verificado con pruebas automáticas
+(en Linux y, si ves el sello de la release, en Windows); la prueba en tu equipo es la primera con Firefox real.
+Windows puede mostrar un aviso de SmartScreen porque los .exe no están firmados.
+
+Qué incluye
+-----------
+  w11dl.exe        Línea de órdenes: w11dl <url> -o archivo.zip   (opciones: w11dl --help)
+  w11dl-host.exe   Host de mensajería nativa para el navegador (register, status, run-queue...)
+  extension\       Extensión de Firefox (se carga como complemento temporal)
+  tools\           yt-dlp, ffmpeg y ffprobe ya incluidos (ver NOTICES.txt): no hay que instalar nada
+  SHA256SUMS.txt   Suma de verificación de cada archivo del paquete
+
+Requisitos
+----------
+  - Windows 11 de 64 bits y Firefox 128 o superior. Nada más: Python y ffmpeg NO hacen falta.
+  - Los programas de la carpeta tools se usan automáticamente. Si prefieres otro ffmpeg, define
+    W11DL_FFMPEG con su ruta.
+
+Instalación
+-----------
+  1. Descomprime la carpeta en un lugar PERMANENTE (por ejemplo C:\W11DownloaderPro).
+     El registro guarda la ruta de w11dl-host.exe: si la mueves, repite el paso 2.
+  2. En PowerShell, dentro de esa carpeta:
+        .\w11dl-host.exe register --firefox-id w11dl@reiniertutoriales
+     Esto escribe un manifiesto en %LOCALAPPDATA%\W11DownloaderPro y una clave en
+     HKCU\Software\Mozilla\NativeMessagingHosts (solo tu usuario; no hace falta ser administrador).
+     Comprueba también el yt-dlp incluido y lo indica.
+  3. En Firefox abre  about:debugging#/runtime/this-firefox  → "Cargar complemento temporal…" →
+     elige  extension\manifest.json
+     El complemento temporal se quita al cerrar Firefox; hay que cargarlo de nuevo cada vez.
+  4. Las descargas se guardan en tu carpeta Descargas (%USERPROFILE%\Downloads).
+     Junto a lo descargado se crea una carpeta oculta .w11dl-locks con archivos .lock vacíos: son la
+     exclusión que impide que dos descargas usen el mismo destino. Es normal; no la borres mientras
+     haya descargas en curso.
+
+Qué probar (y qué contarme)
+---------------------------
+  1. Descarga normal: pulsa un enlace a un .zip/.exe/.iso grande. Debe aparecer "Capturada" y el
+     archivo en Descargas. ¿Se abre la ventana de descarga de Firefox o la toma el acelerador?
+  2. Enlace con sesión iniciada (cookies): descarga algo que exija iniciar sesión.
+  3. Popup de la extensión: cola, pausar, reanudar, cancelar, límite de velocidad, "dejar en espera".
+  4. Botón sobre vídeos: pasa el ratón por un vídeo; arriba a la derecha debe salir "Descargar vídeo".
+     Prueba una página con un .mp4 directo, YouTube y otro sitio. Anota cuáles funcionan.
+  5. Pantalla completa: ¿el botón sigue visible?
+  6. Reanudar: pausa una descarga grande y reanúdala. Cierra Firefox a mitad y comprueba qué pasa.
+  7. Vídeo con imagen y sonido separados (p. ej. YouTube): pausa y cancela también mientras «une»; tras
+     cancelar no deben quedar archivos .video, .audio ni .merging. Cierra Firefox con una descarga de
+     vídeo pausada, ábrelo y reanúdala: o termina con sonido, o falla con un mensaje (nunca un vídeo mudo).
+  8. Dos pestañas/ventanas de Firefox con la extensión: el segundo host no debe poder cancelar ni
+     pausar lo del primero, y avisa de que no guarda la cola.
+  9. Si el host no responde, la descarga debe quedar en Firefox (respaldo). Cuéntame si pasa.
+  Para cada fallo: la acción, el sitio, el mensaje exacto y la versión de Firefox. Para el rendimiento:
+  define  W11DL_TRACE=1  y ejecuta  .\w11dl.exe <url> -c 8  desde PowerShell; copia las líneas [trace].
+
+Línea de órdenes (útil para aislar problemas)
+---------------------------------------------
+  .\w11dl.exe https://sitio/archivo.zip -o archivo.zip -c 8
+  .\w11dl.exe https://sitio/archivo.zip --limit 2M          (límite de velocidad)
+  .\w11dl.exe "https://sitio/pagina-con-video" --video      (usa el yt-dlp y el ffmpeg incluidos)
+  .\w11dl-host.exe status                                    (¿está listo el vídeo?)
+
+Programar una cola (opcional, sin verificar en Windows)
+-------------------------------------------------------
+  .\w11dl-host.exe schedule --at 2026-10-14T03:00 --after nothing
+  .\w11dl-host.exe unschedule
+  --after acepta nothing, sleep, hibernate o shutdown (el apagado espera 60 s; se aborta con shutdown /a).
+
+Límites conocidos de esta versión
+---------------------------------
+  - Solo se capturan navegaciones por GET; las descargas por POST las hace Firefox.
+  - No se capturan descargas generadas por JavaScript (blob:, fetch/XHR) ni de iframes.
+  - Sin ETag fuerte ni Last-Modified en el servidor, una descarga interrumpida empieza de cero.
+  - El vídeo con DRM y las emisiones en directo no se pueden descargar.
+  - Los vídeos por HLS/DASH los baja yt-dlp (no el motor propio); sin cookies del navegador.
+  - Usa el vídeo respetando los términos de cada sitio y la ley de tu país.
+
+Desinstalar
+-----------
+  .\w11dl-host.exe unregister      (quita el registro) y borra la carpeta.
+  Si programaste una cola:  .\w11dl-host.exe unschedule

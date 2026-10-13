@@ -20,6 +20,12 @@ pub enum Error {
     #[error("cabecera Content-Range inconsistente: {0}")]
     BadContentRange(String),
 
+    #[error("otra descarga ya está escribiendo en este archivo: {0}")]
+    Busy(String),
+
+    #[error("el servidor no envió nada durante {0}")]
+    Timeout(String),
+
     #[error("fragmento truncado: se esperaban {expected} bytes y llegaron {received}")]
     Truncated { expected: u64, received: u64 },
 
@@ -34,6 +40,12 @@ pub enum Error {
 
     #[error("el estado de reanudación no es válido: {0}")]
     CorruptState(#[from] serde_json::Error),
+
+    #[error("{0}")]
+    Video(String),
+
+    #[error("preparación: {0}")]
+    Setup(String),
 
     #[error("hash SHA-256 no coincide: esperado {expected}, obtenido {actual}")]
     HashMismatch { expected: String, actual: String },

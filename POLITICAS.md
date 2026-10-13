@@ -8,6 +8,8 @@ Este documento es vinculante para todo código, commit y decisión técnica del 
 2. Cada dependencia debe justificarse. Si la biblioteca estándar del lenguaje resuelve el problema con calidad equivalente, se usa la biblioteca estándar.
 3. Las versiones quedan fijadas mediante archivo de bloqueo (lockfile) commiteado.
 4. Una dependencia sin mantenimiento activo, con vulnerabilidades abiertas o con licencia incompatible no se incorpora.
+5. **Siempre se adopta lo mejor disponible.** Al elegir tecnología, algoritmo, protocolo o idea tomada de otros proyectos, se prioriza la opción vigente y más eficiente que sea legal, verificable y mantenible. Antes de decidir se compara al menos una alternativa y se registra el motivo de la elección en la descripción del PR.
+6. Lo "mejor" no justifica incumplir la ley ni los términos de uso de terceros, ni incorporar código sin revisar su licencia.
 
 ## 2. Eficiencia: correcta antes que corta
 

@@ -1,0 +1,960 @@
+//! Protocolo de mensajería nativa (Native Messaging) con el navegador.
+//!
+//! Cada mensaje es JSON precedido de su longitud en 4 bytes little-endian. El host acusa recibo
+//! (`accepted`) antes de empezar la descarga: el navegador solo debe cancelar su propia descarga
+//! cuando recibe ese acuse, así una descarga nunca se pierde por un fallo de la conexión.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Semaphore, mpsc};
+use url::Url;
+
+use crate::engine::{self, Control, Options, Outcome};
+use crate::limits::RateLimiter;
+use crate::naming;
+use crate::proxy::ProxyMode;
+use crate::queue::{Record, Registry, State};
+
+/// Límite de un mensaje entrante, según el protocolo del navegador.
+pub const MAX_INCOMING: usize = 1024 * 1024;
+const MAX_CONCURRENT: usize = 4;
+const PROGRESS_EVERY: Duration = Duration::from_millis(500);
+/// Cabeceras que la extensión puede enviar. Cualquier otra se rechaza.
+const ALLOWED_HEADERS: &[&str] = &["cookie", "referer", "user-agent", "accept-language"];
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Incoming {
+    Ping,
+    Enqueue {
+        id: String,
+        url: String,
+        /// Nombre sugerido por el navegador. Si falta, se deriva de la URL.
+        filename: Option<String>,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Solo registrarla en la cola, sin empezar: la inicia el usuario o la cola programada.
+        /// Las cabeceras de sesión no se guardan en disco, así que una descarga que dependa de
+        /// cookies debe empezarse mientras el host siga abierto.
+        #[serde(default)]
+        queued: bool,
+    },
+    /// Página o enlace de vídeo: el host lo resuelve con yt-dlp antes de descargar.
+    EnqueueVideo {
+        id: String,
+        page: String,
+    },
+    /// Pausa una descarga en curso. Conserva el progreso para reanudarla.
+    Pause {
+        id: String,
+    },
+    /// Reanuda una descarga pausada, interrumpida o fallida desde su progreso guardado.
+    Resume {
+        id: String,
+    },
+    /// Cancela una descarga y borra lo descargado.
+    Cancel {
+        id: String,
+    },
+    /// Devuelve la cola completa.
+    List,
+    /// Fija el límite de velocidad total en bytes/s (0 = sin límite) y lo recuerda. Sin valor,
+    /// solo consulta el actual. Se aplica en caliente a las descargas en curso.
+    SetLimit {
+        bytes_per_sec: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Outgoing {
+    Pong,
+    /// La resolución con yt-dlp está en curso. No es final: la petición sigue viva.
+    Probing {
+        id: String,
+    },
+    Accepted {
+        id: String,
+        path: String,
+    },
+    Progress {
+        id: String,
+        bytes: u64,
+    },
+    Done {
+        id: String,
+        path: String,
+        bytes: u64,
+    },
+    Error {
+        id: String,
+        message: String,
+    },
+    Paused {
+        id: String,
+        bytes: u64,
+    },
+    Canceled {
+        id: String,
+    },
+    Queue {
+        items: Vec<Record>,
+    },
+    /// Límite de velocidad vigente en bytes/s (0 = sin límite).
+    Limit {
+        bytes_per_sec: u64,
+    },
+}
+
+/// Lee un mensaje. `Ok(None)` indica que el navegador cerró la conexión.
+pub async fn read_message<R: AsyncRead + Unpin>(input: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_bytes = [0u8; 4];
+    match input.read_exact(&mut len_bytes).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_INCOMING {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mensaje demasiado grande",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    input.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+pub async fn write_message<W: AsyncWrite + Unpin, T: Serialize>(
+    output: &mut W,
+    value: &T,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    let len = u32::try_from(body.len()).map_err(std::io::Error::other)?;
+    output.write_all(&len.to_le_bytes()).await?;
+    output.write_all(&body).await?;
+    output.flush().await
+}
+
+/// Atiende mensajes hasta que el navegador cierra la conexión. Las descargas continúan hasta
+/// terminar; el proceso espera a que terminen antes de salir.
+pub async fn serve<R, W>(mut input: R, mut output: W, out_dir: PathBuf) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+    let writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            write_message(&mut output, &message).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let limiter = RateLimiter::new(settings::load_limit(&out_dir));
+    let mut jobs = tokio::task::JoinSet::new();
+    // Propietario de la cola mientras dure la sesión; si otro proceso lo es, esta sesión funciona pero
+    // no la guarda (y el primer intento de guardar avisa a la extensión una sola vez).
+    let (registry, _queue_owner) = Registry::open(&out_dir);
+    persist(&registry, &out_dir, &tx);
+
+    while let Some(raw) = read_message(&mut input).await? {
+        match serde_json::from_slice::<Incoming>(&raw) {
+            Ok(Incoming::Ping) => {
+                let _ = tx.send(Outgoing::Pong);
+            }
+            Ok(Incoming::EnqueueVideo { id, page }) => {
+                if !is_web(&page) {
+                    let _ = tx.send(Outgoing::Error {
+                        id,
+                        message: format!("página no web: {page}"),
+                    });
+                    continue;
+                }
+                let _ = tx.send(Outgoing::Probing { id: id.clone() });
+                let slots = Arc::clone(&slots);
+                let tx = tx.clone();
+                let out_dir = out_dir.clone();
+                let registry = registry.clone();
+                let limiter = Arc::clone(&limiter);
+                jobs.spawn(async move {
+                    let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+                    run_video(id, page, out_dir, registry, tx, limiter).await;
+                });
+            }
+            Ok(Incoming::Enqueue { id, queued, .. }) if queued && registry.is_read_only() => {
+                let _ = tx.send(Outgoing::Error {
+                    id,
+                    message: "otra instancia de W11DownloaderPro gestiona la cola de esta carpeta: \
+                              la espera no se podría guardar. Descarga ahora o cierra la otra instancia"
+                        .into(),
+                });
+            }
+            Ok(Incoming::Enqueue {
+                id,
+                url,
+                filename,
+                headers,
+                queued,
+            }) => match prepare(
+                &id,
+                &url,
+                filename.as_deref(),
+                &headers,
+                &out_dir,
+                &registry,
+            ) {
+                Ok(mut job) => {
+                    let _ = tx.send(Outgoing::Accepted {
+                        id: id.clone(),
+                        path: job.output.display().to_string(),
+                    });
+                    job.control = registry.insert(
+                        Record {
+                            id: id.clone(),
+                            url: job.url.clone(),
+                            path: job.output.clone(),
+                            state: State::Running,
+                            bytes: 0,
+                            via_ytdlp: false,
+                            merged: false,
+                            page: None,
+                        },
+                        job.headers.clone(),
+                    );
+                    persist(&registry, &out_dir, &tx);
+                    if queued {
+                        registry.update(&id, |e| e.record.state = State::Queued);
+                        persist(&registry, &out_dir, &tx);
+                        continue;
+                    }
+                    let slots = Arc::clone(&slots);
+                    let tx = tx.clone();
+                    let registry = registry.clone();
+                    let out_dir = out_dir.clone();
+                    let limiter = Arc::clone(&limiter);
+                    jobs.spawn(async move {
+                        let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+                        run(job, tx, registry, out_dir, limiter).await;
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Outgoing::Error { id, message });
+                }
+            },
+            Ok(Incoming::Pause { id }) => {
+                let running = registry
+                    .get(&id)
+                    .filter(|e| e.record.state == State::Running);
+                match running {
+                    Some(entry) => entry.control.pause(),
+                    None => {
+                        let _ = tx.send(Outgoing::Error {
+                            id,
+                            message: "no está en curso: solo se pausan descargas activas".into(),
+                        });
+                    }
+                }
+            }
+            Ok(Incoming::Cancel { id }) => match registry.get(&id) {
+                Some(entry) if entry.record.state == State::Running => entry.control.cancel(),
+                Some(entry) if entry.record.state.is_resumable() => {
+                    if let Err(message) = discard_job(&entry.record, &out_dir).await {
+                        let _ = tx.send(Outgoing::Error {
+                            id,
+                            message: format!("no se puede cancelar ahora: {message}"),
+                        });
+                        continue;
+                    }
+                    registry.update(&id, |e| e.record.state = State::Canceled);
+                    persist(&registry, &out_dir, &tx);
+                    let _ = tx.send(Outgoing::Canceled { id });
+                }
+                _ => {
+                    let _ = tx.send(Outgoing::Error {
+                        id,
+                        message: "no hay nada que cancelar".into(),
+                    });
+                }
+            },
+            Ok(Incoming::Resume { id }) => match registry.get(&id) {
+                Some(entry) if entry.record.state.is_resumable() => {
+                    let control = Control::default();
+                    registry.update(&id, |e| {
+                        e.control = control.clone();
+                        e.record.state = State::Running;
+                    });
+                    persist(&registry, &out_dir, &tx);
+                    let job = Job {
+                        id: id.clone(),
+                        url: entry.record.url.clone(),
+                        output: entry.record.path.clone(),
+                        headers: entry.headers.clone(),
+                        control,
+                        merge: entry.merge.clone(),
+                        ytdlp: entry.record.via_ytdlp,
+                        merged: entry.record.merged,
+                        page: entry.record.page.clone(),
+                    };
+                    let _ = tx.send(Outgoing::Accepted {
+                        id: id.clone(),
+                        path: entry.record.path.display().to_string(),
+                    });
+                    let slots = Arc::clone(&slots);
+                    let tx = tx.clone();
+                    let registry = registry.clone();
+                    let out_dir = out_dir.clone();
+                    let limiter = Arc::clone(&limiter);
+                    jobs.spawn(async move {
+                        let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+                        run(job, tx, registry, out_dir, limiter).await;
+                    });
+                }
+                _ => {
+                    let _ = tx.send(Outgoing::Error {
+                        id,
+                        message: "esta descarga no se puede reanudar".into(),
+                    });
+                }
+            },
+            Ok(Incoming::SetLimit { bytes_per_sec }) => {
+                if let Some(rate) = bytes_per_sec {
+                    limiter.set_rate(rate);
+                    if let Err(e) = settings::save_limit(&out_dir, rate) {
+                        eprintln!("w11dl-host: no se pudo guardar el límite: {e}");
+                    }
+                }
+                let _ = tx.send(Outgoing::Limit {
+                    bytes_per_sec: limiter.rate(),
+                });
+            }
+            Ok(Incoming::List) => {
+                let _ = tx.send(Outgoing::Queue {
+                    items: registry.records(),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(Outgoing::Error {
+                    id: String::new(),
+                    message: format!("mensaje no válido: {e}"),
+                });
+            }
+        }
+    }
+
+    while jobs.join_next().await.is_some() {}
+    drop(tx);
+    writer.await.map_err(std::io::Error::other)??;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Job {
+    id: String,
+    url: String,
+    output: PathBuf,
+    headers: HeaderMap,
+    control: Control,
+    /// Imagen y sonido por separado: se descargan ambos y se unen con ffmpeg.
+    merge: Option<crate::merge::MergeJob>,
+    /// La descarga la hace yt-dlp desde la página (`url`).
+    ytdlp: bool,
+    /// Es un vídeo con imagen y sonido separados. Si `merge` falta (cola recuperada tras reiniciar),
+    /// se vuelve a resolver `page` antes de empezar; nunca se baja solo la imagen.
+    merged: bool,
+    page: Option<String>,
+}
+
+/// Valida la petición antes de aceptarla: URL web, cabeceras permitidas y nombre seguro.
+fn prepare(
+    id: &str,
+    url: &str,
+    filename: Option<&str>,
+    headers: &HashMap<String, String>,
+    out_dir: &std::path::Path,
+    registry: &Registry,
+) -> Result<Job, String> {
+    let parsed = Url::parse(url).map_err(|_| format!("URL no válida: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("esquema no permitido: {}", parsed.scheme()));
+    }
+
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        if !ALLOWED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(format!("cabecera no permitida: {name}"));
+        }
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
+        let value = HeaderValue::from_str(value).map_err(|e| e.to_string())?;
+        map.append(name, value);
+    }
+
+    let name = filename
+        .and_then(naming::sanitize)
+        .unwrap_or_else(|| naming::file_name(&parsed));
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let output = registry.claim_path(out_dir, &name, &[]);
+
+    Ok(Job {
+        id: id.to_owned(),
+        url: url.to_owned(),
+        output,
+        headers: map,
+        control: Control::default(),
+        merge: None,
+        ytdlp: false,
+        merged: false,
+        page: None,
+    })
+}
+
+fn is_web(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// Resuelve la página con yt-dlp y, si hay un formato, la descarga como una petición normal.
+async fn run_video(
+    id: String,
+    page: String,
+    out_dir: PathBuf,
+    registry: Registry,
+    tx: mpsc::UnboundedSender<Outgoing>,
+    limiter: Arc<RateLimiter>,
+) {
+    let opts = crate::video::ProbeOptions {
+        python: crate::video::default_python(),
+        cookies: None,
+        ffmpeg: crate::video::find_ffmpeg().await,
+    };
+    let ffmpeg = opts.ffmpeg.clone();
+    let choice = match crate::video::probe(&page, &opts).await {
+        Ok(choice) => choice,
+        Err(e) => {
+            let _ = tx.send(Outgoing::Error {
+                id,
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+    // El contenedor de un vídeo delegado lo decide yt-dlp: se reservan todas las extensiones posibles.
+    // Con sonido aparte hace falta ffmpeg: sin él no se baja solo la imagen como si fuera el vídeo.
+    if choice.audio.is_some() && ffmpeg.is_none() {
+        let _ = tx.send(Outgoing::Error {
+            id,
+            message: "este vídeo trae el sonido aparte y no se encontró ffmpeg para unirlo".into(),
+        });
+        return;
+    }
+    let merged = choice.audio.is_some();
+    let alternatives: &[&str] = if choice.via_ytdlp {
+        &["mp4", "mkv", "webm", "mov"]
+    } else {
+        &[]
+    };
+    let output = registry.claim_path(&out_dir, &choice.filename, alternatives);
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        registry.release_path(&output);
+        let _ = tx.send(Outgoing::Error {
+            id,
+            message: e.to_string(),
+        });
+        return;
+    }
+    let mut headers = HeaderMap::new();
+    for (name, value) in &choice.headers {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(n, v);
+        }
+    }
+    let _ = tx.send(Outgoing::Accepted {
+        id: id.clone(),
+        path: output.display().to_string(),
+    });
+    let control = registry.insert(
+        Record {
+            id: id.clone(),
+            url: choice.url.clone(),
+            path: output.clone(),
+            state: State::Running,
+            bytes: 0,
+            via_ytdlp: choice.via_ytdlp,
+            merged,
+            page: Some(page.clone()),
+        },
+        headers.clone(),
+    );
+    let merge = match (choice.audio, ffmpeg) {
+        (Some(audio), Some(ffmpeg)) => Some(merge_job(&choice.url, &headers, audio, ffmpeg)),
+        _ => None,
+    };
+    registry.update(&id, |e| e.merge = merge.clone());
+    let job = Job {
+        id,
+        url: choice.url,
+        output,
+        headers,
+        control,
+        merge,
+        ytdlp: choice.via_ytdlp,
+        merged,
+        page: Some(page),
+    };
+    run(job, tx, registry, out_dir, limiter).await;
+}
+
+/// Borra todo lo propio de un trabajo que no está en curso, según su tipo, tomando antes la exclusión
+/// del destino. Los errores (salvo «no existe») se comunican: no se confirma una cancelación que dejó restos.
+async fn discard_job(record: &Record, out_dir: &Path) -> Result<(), String> {
+    if record.merged {
+        crate::merge::discard(&record.path)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        crate::engine::discard_partials(&record.path)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if record.via_ytdlp {
+        let dir = record.path.parent().unwrap_or(out_dir);
+        match tokio::fs::remove_dir_all(crate::ytdlp::temp_dir_for(dir, &record.id)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn header_map(pairs: &[(String, String)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in pairs {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            map.append(n, v);
+        }
+    }
+    map
+}
+
+fn merge_job(
+    video_url: &str,
+    video_headers: &HeaderMap,
+    audio: crate::video::AudioPart,
+    ffmpeg: PathBuf,
+) -> crate::merge::MergeJob {
+    crate::merge::MergeJob {
+        video: crate::merge::Track {
+            url: video_url.to_owned(),
+            headers: video_headers.clone(),
+        },
+        audio: crate::merge::Track {
+            url: audio.url,
+            headers: header_map(&audio.headers),
+        },
+        ffmpeg,
+    }
+}
+
+/// Vuelve a resolver la página de un vídeo con pistas separadas (los enlaces firmados caducan y no se
+/// guardan). Falla si ya no hay pareja imagen+sonido: reanudar nunca degrada a descargar solo la imagen.
+async fn resolve_merge(page: &str) -> Result<crate::merge::MergeJob, String> {
+    let ffmpeg = crate::video::find_ffmpeg().await;
+    let opts = crate::video::ProbeOptions {
+        python: crate::video::default_python(),
+        cookies: None,
+        ffmpeg: ffmpeg.clone(),
+    };
+    let choice = crate::video::probe(page, &opts)
+        .await
+        .map_err(|e| format!("no se pudo volver a resolver el vídeo: {e}"))?;
+    match (choice.audio, ffmpeg) {
+        (Some(audio), Some(ffmpeg)) if !choice.via_ytdlp => {
+            let headers = header_map(&choice.headers);
+            Ok(merge_job(&choice.url, &headers, audio, ffmpeg))
+        }
+        _ => Err(
+            "no se pudo reanudar: la página ya no ofrece imagen y sonido por separado (o falta \
+             ffmpeg); vuelve a añadir el vídeo"
+                .into(),
+        ),
+    }
+}
+
+/// Ejecuta una descarga controlada y deja su resultado en la cola (y en disco).
+async fn run(
+    job: Job,
+    tx: mpsc::UnboundedSender<Outgoing>,
+    registry: Registry,
+    out_dir: PathBuf,
+    limiter: Arc<RateLimiter>,
+) {
+    let progress = Arc::new(AtomicU64::new(0));
+    let reporter = {
+        let progress = Arc::clone(&progress);
+        let tx = tx.clone();
+        let id = job.id.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PROGRESS_EVERY);
+            loop {
+                ticker.tick().await;
+                let bytes = progress.load(Ordering::Relaxed);
+                let _ = tx.send(Outgoing::Progress {
+                    id: id.clone(),
+                    bytes,
+                });
+            }
+        })
+    };
+
+    if job.ytdlp {
+        run_ytdlp(job, progress, reporter, tx, registry, out_dir, limiter).await;
+        return;
+    }
+
+    let mut opts = Options::new(job.url, job.output.clone());
+    opts.headers = job.headers;
+    opts.proxy = ProxyMode::System;
+    opts.progress = Some(Arc::clone(&progress));
+    opts.limiter = Some(limiter);
+
+    let merge = match (job.merge, job.merged) {
+        (Some(merge), _) => Ok(Some(merge)),
+        (None, false) => Ok(None),
+        // Vídeo con pistas separadas recuperado tras reiniciar: los enlaces no se guardaron.
+        (None, true) => match job.page.as_deref() {
+            Some(page) => resolve_merge(page).await.map(|merge| {
+                registry.update(&job.id, |e| e.merge = Some(merge.clone()));
+                Some(merge)
+            }),
+            None => Err("no se puede reanudar: falta la página de origen del vídeo".into()),
+        },
+    };
+    let result = match merge {
+        Ok(Some(merge)) => crate::merge::download_merged(opts, merge, job.control).await,
+        Ok(None) => engine::download_controlled(opts, job.control).await,
+        Err(message) => Err(crate::error::Error::Video(message)),
+    };
+    reporter.abort();
+
+    let message = match result {
+        Ok(Outcome::Completed(report)) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Done;
+                e.record.bytes = report.bytes;
+            });
+            Outgoing::Done {
+                id: job.id.clone(),
+                path: job.output.display().to_string(),
+                bytes: report.bytes,
+            }
+        }
+        Ok(Outcome::Paused { bytes }) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Paused;
+                e.record.bytes = bytes;
+            });
+            Outgoing::Paused {
+                id: job.id.clone(),
+                bytes,
+            }
+        }
+        Ok(Outcome::Canceled) => {
+            registry.update(&job.id, |e| e.record.state = State::Canceled);
+            Outgoing::Canceled { id: job.id.clone() }
+        }
+        Err(e) => {
+            let message = e.to_string();
+            registry.update(&job.id, |en| {
+                en.record.state = State::Failed {
+                    message: message.clone(),
+                }
+            });
+            Outgoing::Error {
+                id: job.id.clone(),
+                message,
+            }
+        }
+    };
+    persist(&registry, &out_dir, &tx);
+    let _ = tx.send(message);
+}
+
+/// Ejecuta sin navegador lo que esté en espera (`Queued`) o interrumpido, y resume el resultado.
+/// Lo usa la tarea programada: no hay proceso residente, solo esta ejecución puntual.
+///
+/// Falla con `Error::Busy` si otro proceso (p. ej. el host del navegador) ya gestiona la cola de la
+/// carpeta: dos procesos no pueden escribirla a la vez, y la cola programada debe reintentarse más tarde.
+pub async fn run_pending(out_dir: PathBuf) -> crate::error::Result<crate::schedule::Summary> {
+    let (registry, owner) = Registry::open(&out_dir);
+    let Some(_queue_owner) = owner else {
+        return Err(crate::error::Error::Busy(format!(
+            "otra instancia de W11DownloaderPro gestiona la cola de {}",
+            out_dir.display()
+        )));
+    };
+    let limiter = RateLimiter::new(settings::load_limit(&out_dir));
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
+    // Nadie escucha los eventos: se vacían para que el canal no crezca.
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let mut jobs = tokio::task::JoinSet::new();
+    let pending: Vec<Record> = registry
+        .records()
+        .into_iter()
+        .filter(|r| matches!(r.state, State::Queued | State::Interrupted))
+        .collect();
+    let ids: Vec<String> = pending.iter().map(|r| r.id.clone()).collect();
+    for record in pending {
+        let control = Control::default();
+        registry.update(&record.id, |e| {
+            e.control = control.clone();
+            e.record.state = State::Running;
+        });
+        let job = Job {
+            id: record.id,
+            url: record.url,
+            output: record.path,
+            headers: HeaderMap::new(),
+            control,
+            merge: None,
+            ytdlp: record.via_ytdlp,
+            merged: record.merged,
+            page: record.page,
+        };
+        let (slots, tx, registry, out_dir, limiter) = (
+            Arc::clone(&slots),
+            tx.clone(),
+            registry.clone(),
+            out_dir.clone(),
+            Arc::clone(&limiter),
+        );
+        jobs.spawn(async move {
+            let _permit = slots.acquire_owned().await.expect("semáforo abierto");
+            run(job, tx, registry, out_dir, limiter).await;
+        });
+    }
+    persist(&registry, &out_dir, &tx);
+    while jobs.join_next().await.is_some() {}
+
+    let mut summary = crate::schedule::Summary::default();
+    for id in ids {
+        match registry.get(&id).map(|e| e.record.state) {
+            Some(State::Done) => summary.done += 1,
+            Some(State::Failed { .. }) => summary.failed += 1,
+            _ => summary.canceled += 1,
+        }
+    }
+    Ok(summary)
+}
+
+/// Ajustes persistentes del host (solo el límite de velocidad; nada de sesión).
+mod settings {
+    use std::path::Path;
+
+    const FILE: &str = ".w11dl-settings.json";
+
+    pub fn load_limit(dir: &Path) -> u64 {
+        std::fs::read_to_string(dir.join(FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("limit_bytes_per_sec")?.as_u64())
+            .unwrap_or(0)
+    }
+
+    pub fn save_limit(dir: &Path, rate: u64) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!("{FILE}.tmp"));
+        std::fs::write(
+            &tmp,
+            serde_json::json!({ "limit_bytes_per_sec": rate }).to_string(),
+        )?;
+        std::fs::rename(&tmp, dir.join(FILE))
+    }
+}
+
+/// Descarga delegada en yt-dlp (HLS, DASH…): el resultado se guarda igual que el de cualquier otra,
+/// pero la ruta final la decide yt-dlp según el contenedor.
+async fn run_ytdlp(
+    job: Job,
+    progress: Arc<AtomicU64>,
+    reporter: tokio::task::JoinHandle<()>,
+    tx: mpsc::UnboundedSender<Outgoing>,
+    registry: Registry,
+    out_dir: PathBuf,
+    limiter: Arc<RateLimiter>,
+) {
+    let result = match crate::video::default_python() {
+        None => Err(crate::error::Error::Video(
+            "falta el entorno de yt-dlp: ejecuta w11dl-host setup".into(),
+        )),
+        Some(python) => {
+            // Mismo bloqueo de destino que cualquier otra descarga: dos trabajos no comparten nombre.
+            let destination = crate::engine::DestinationLock::acquire(&job.output).await;
+            let dir = job.output.parent().unwrap_or(&out_dir).to_path_buf();
+            let ytdlp_job = crate::ytdlp::YtDlpJob {
+                python,
+                ffmpeg: crate::video::find_ffmpeg().await,
+                page: job.url.clone(),
+                temp_dir: crate::ytdlp::temp_dir_for(&dir, &job.id),
+                stem: job
+                    .output
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "video".into()),
+                out_dir: dir,
+                rate_limit: limiter.rate(),
+                cookies: None,
+            };
+            match destination {
+                Ok(_held) => {
+                    crate::ytdlp::download(&ytdlp_job, job.control.clone(), Some(progress)).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+    reporter.abort();
+
+    let message = match result {
+        Ok((Outcome::Completed(report), Some(path))) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Done;
+                e.record.bytes = report.bytes;
+                e.record.path = path.clone();
+            });
+            Outgoing::Done {
+                id: job.id.clone(),
+                path: path.display().to_string(),
+                bytes: report.bytes,
+            }
+        }
+        Ok((Outcome::Paused { bytes }, _)) => {
+            registry.update(&job.id, |e| {
+                e.record.state = State::Paused;
+                e.record.bytes = bytes;
+            });
+            Outgoing::Paused {
+                id: job.id.clone(),
+                bytes,
+            }
+        }
+        Ok((Outcome::Canceled, _)) => {
+            registry.update(&job.id, |e| e.record.state = State::Canceled);
+            Outgoing::Canceled { id: job.id.clone() }
+        }
+        Ok((Outcome::Completed(_), None)) => {
+            failed(&registry, &job.id, "yt-dlp no indicó el archivo final")
+        }
+        Err(e) => failed(&registry, &job.id, &e.to_string()),
+    };
+    persist(&registry, &out_dir, &tx);
+    let _ = tx.send(message);
+}
+
+fn failed(registry: &Registry, id: &str, message: &str) -> Outgoing {
+    registry.update(id, |en| {
+        en.record.state = State::Failed {
+            message: message.to_owned(),
+        }
+    });
+    Outgoing::Error {
+        id: id.to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+/// Guarda la cola y, si empieza a fallar, lo comunica a la extensión además de registrarlo.
+fn persist(registry: &Registry, dir: &Path, tx: &mpsc::UnboundedSender<Outgoing>) {
+    if let Some(message) = registry.save_notice(dir) {
+        eprintln!("w11dl-host: {message}");
+        let _ = tx.send(Outgoing::Error {
+            id: String::new(),
+            message,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn marco_ida_y_vuelta() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_message(&mut a, &Outgoing::Pong).await.unwrap();
+        let raw = read_message(&mut b).await.unwrap().unwrap();
+        assert_eq!(raw, br#"{"type":"pong"}"#);
+    }
+
+    #[tokio::test]
+    async fn mensaje_demasiado_grande_se_rechaza() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&((MAX_INCOMING as u32) + 1).to_le_bytes())
+            .await
+            .unwrap();
+        assert!(read_message(&mut b).await.is_err());
+    }
+
+    #[test]
+    fn cabecera_no_permitida_se_rechaza() {
+        let dir = tempfile::tempdir().unwrap();
+        let headers = HashMap::from([("X-Evil".to_owned(), "1".to_owned())]);
+        let err = prepare(
+            "1",
+            "https://x.test/a.zip",
+            None,
+            &headers,
+            dir.path(),
+            &Registry::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no permitida"), "{err}");
+    }
+
+    #[test]
+    fn esquema_no_web_se_rechaza() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = prepare(
+            "1",
+            "file:///etc/passwd",
+            None,
+            &HashMap::new(),
+            dir.path(),
+            &Registry::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("esquema"), "{err}");
+    }
+
+    #[test]
+    fn nombre_sugerido_no_escapa_del_directorio() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = prepare(
+            "1",
+            "https://x.test/a.zip",
+            Some("..\\..\\evil.exe"),
+            &HashMap::new(),
+            dir.path(),
+            &Registry::default(),
+        )
+        .unwrap();
+        assert_eq!(job.output.parent().unwrap(), dir.path());
+        assert_eq!(job.output.file_name().unwrap(), "evil.exe");
+    }
+}
